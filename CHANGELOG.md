@@ -4,6 +4,8 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
 ## [Unreleased]
 
+## [0.7.8] - 2026-05-05
+
 ### Added
 
 - **D-10**: `kb-mcp index --quiet` flag to suppress per-file progress output
@@ -14,6 +16,8 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
   `indicatif` progress bar with elapsed / position / percent / ETA. On non-TTY
   (pipe / redirect): periodic `Progress: N/M (P%)` lines (~20 emits per run +
   100% anchor). Auto-detected via `std::io::IsTerminal` on stderr.
+  Incremental runs (`force=false`) tick the bar on unchanged/skipped files too,
+  so the bar always reaches 100%.
 
 ### Changed
 
