@@ -1,6 +1,6 @@
 [package]
 name = "kb-mcp"
-version = "0.7.5"
+version = "0.7.6"
 edition = "2024"
 description = "MCP server providing semantic hybrid search (sqlite-vec + FTS5 with optional cross-encoder reranking) over a Markdown / plain-text knowledge base."
 authors = ["koshian"]
@@ -15,6 +15,10 @@ categories = ["command-line-utilities", "database", "text-processing"]
 rmcp = { version = "1", features = ["server", "transport-io", "transport-streamable-http-server", "macros"] }
 tokio = { version = "1", features = ["full"] }
 axum = "0.8"
+# [D-11 / feature-39] /healthz Host validation を `http::uri::Authority::try_from`
+# 委譲に refactor するため direct dep 宣言。axum 0.8 transitive で既に v1.4.0 が
+# 入っているので追加コストなし。
+http = "1"
 fastembed = "5"
 rusqlite = { version = "0.39", features = ["bundled"] }
 sqlite-vec = "0.1"
