@@ -13,6 +13,7 @@ Source-level structure and data flow of kb-mcp, for contributors extending or mo
 | `src/config.rs` | 4-tier `kb-mcp.toml` discovery (`--config` flag → CWD → `.git` ancestor (CWD + up to 19 ancestors) → binary-side legacy). `Config::discover()` returns a `ConfigSource` enum that `main.rs` logs at startup. Resolves `CLI > config > default` precedence. Injects `FASTEMBED_CACHE_DIR` env when the config sets it and the env is unset. |
 | `src/server.rs` | `rmcp::ServerHandler` impl. Dispatches six MCP tools. `search` routes to `db.search_hybrid` and wraps the result in a `SearchResponse` with `low_confidence` / `match_spans` / `filter_applied` (BREAKING in v0.3.0; see CHANGELOG). |
 | `src/indexer.rs` | `walkdir`-based file scan using `Registry::extensions()`. Parses via the Parser trait, embeds, stores. SHA-256 content-hash diff detection. Incremental APIs (`reindex_single_file` / `deindex_single_file` / `rename_single_file`) shared with the file watcher. |
+| `src/indexer/progress.rs` | (v0.7.8+) `ProgressReporter` + `ProgressMode` enum. Drives per-file output for `kb-mcp index`: `Verbose` (default) / `Quiet` (`--quiet`) / `Auto` (`--progress`, TTY = `indicatif::ProgressBar`, non-TTY = periodic `Progress: N/M (P%)` lines). MCP server `rebuild_index` tool wires `Quiet` directly. Bar lifetime is closed inside `rebuild_index` (lazy init via `start_indexing(total)`) so `Backfilled` / `Found` lines stay plain `eprintln!`. |
 | `src/parser/` | Parser trait + Registry. `mod.rs` (Frontmatter / Chunk / ParsedDocument), `markdown.rs`, `txt.rs`, `registry.rs` (extension lookup). |
 | `src/markdown.rs` | Thin shim over `crate::parser::markdown::MarkdownParser`, retained for legacy `parse()` / `parse_with_excludes()` callers. |
 | `src/watcher.rs` | `notify-debouncer-full` bridged to a tokio channel. Filters by extension and path, then dispatches to `indexer::{reindex,deindex,rename}_single_file`. Runs alongside the MCP server via `tokio::spawn`. |
@@ -81,7 +82,7 @@ The `kb-mcp` CLI follows a **stdout = data, stderr = progress** convention:
   - `kb-mcp search` JSON results
   - `kb-mcp eval` golden-query evaluation results
 - **stderr** carries human-readable progress, status, warnings, and errors:
-  - `kb-mcp index` progress lines (`Indexing ...`, `Done in ...`)
+  - `kb-mcp index` progress lines (`Indexing ...`, `Done in ...`, per-file `  indexed:` / `  renamed:` / `  deleted:`). Use `--quiet` to suppress per-file output (start / found / done summary only) or `--progress` to switch to an `indicatif` bar (TTY) / periodic `Progress: N/M (P%)` lines (non-TTY). The two flags are mutually exclusive and default-off (added v0.7.8).
   - `kb-mcp status` statistics (`Documents: N`, `Chunks: N`)
   - All `tracing` / `eprintln!` diagnostics
 
@@ -97,4 +98,5 @@ When writing subprocess tests, grep `src/main.rs` for the corresponding `Command
 - **`notify`** 8 + **`notify-debouncer-full`** 0.6 — file watcher with debouncing
 - **`axum`** 0.8 — HTTP server for the Streamable HTTP transport
 - **`dirs`** 6 — OS-standard cache directory resolution
+- **`indicatif`** 0.18 — TTY progress bar for `kb-mcp index --progress` (added v0.7.8 / D-10). MSRV 1.70+, ~150 KB binary impact. Auto-detection of stderr TTY uses `std::io::IsTerminal` (Rust 1.70+ stdlib).
 - **`wide`** 0.7 — pure-rust SIMD primitives (`f32x8`) used by the MMR cosine kernel (added in v0.7.2 / feature-31)
