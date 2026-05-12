@@ -12,6 +12,15 @@
 //! lives outside the `with_helpers` module so it runs in default
 //! `cargo test` without the `test-helpers` feature flag.
 
+// codex P2 round 7 on PR #57 (re-evaluated post-merge after CI rustfmt
+// failure): declare `common` at the file top level so rustfmt can resolve
+// the `#[path]` relative to `tests/` rather than the non-existent
+// `tests/with_helpers/`. The nested-mod variant previously here passed
+// `cargo test` on Windows but tripped rustfmt on Linux CI.
+#[cfg(feature = "test-helpers")]
+#[path = "common/mod.rs"]
+mod common;
+
 /// Regression: webui_index.html must not contain `innerHTML` (XSS vector).
 /// Plain compile-time string scan — no `test-helpers` feature required.
 #[test]
@@ -26,8 +35,7 @@ fn webui_index_html_does_not_use_innerhtml() {
 
 #[cfg(feature = "test-helpers")]
 mod with_helpers {
-    #[path = "../common/mod.rs"]
-    mod common;
+    use super::common;
 
     use std::sync::Arc;
 
