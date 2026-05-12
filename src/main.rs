@@ -216,6 +216,47 @@ enum Commands {
     /// Reports recall@k / MRR / nDCG@k and diffs against the previous run.
     /// Details: docs/eval.md
     Eval(EvalCliArgs),
+    /// Register kb-mcp as an OS-level user service (auto-start at login).
+    /// Phase 1: Linux systemd-user / macOS LaunchAgent / Windows Task Scheduler.
+    Service {
+        #[command(subcommand)]
+        action: ServiceSubcommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum ServiceSubcommand {
+    /// Install and register a kb-mcp service
+    Install {
+        #[arg(long, default_value = "kb-mcp", value_parser = kb_mcp::service::validate_service_name)]
+        service_name: String,
+        #[arg(long)]
+        kb_path: Option<PathBuf>,
+        #[arg(long, default_value = "127.0.0.1:3100")]
+        bind: String,
+        #[arg(long)]
+        no_auto_start: bool,
+        #[arg(long)]
+        force: bool,
+        #[arg(long = "i-know")]
+        i_know_non_loopback: bool,
+    },
+    /// Uninstall the kb-mcp service (use --purge --yes to also delete index DB and config)
+    Uninstall {
+        #[arg(default_value = "kb-mcp")]
+        service_name: String,
+        #[arg(long)]
+        purge: bool,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Show service status (running / stopped / not-found, bind, kb_path)
+    Status {
+        #[arg(default_value = "kb-mcp")]
+        service_name: String,
+    },
+    /// List all installed kb-mcp service instances
+    List,
 }
 
 /// Parse a `[0.0, 1.0]` f32 from CLI. NaN / Inf / out-of-range は reject。
@@ -398,6 +439,17 @@ fn main() -> anyhow::Result<()> {
     // CLI parse を先に行い、--config の値を discover に渡す。
     // discover が FASTEMBED_CACHE_DIR を解決するので embedder 初期化より前に来る順序は維持。
     let cli = Cli::parse();
+
+    // codex P2 round 3 on PR #56: `service install/uninstall/status/list` do not
+    // consume `Config` — they read their own `kb-mcp.toml` from `config_home`
+    // (or none at all for `list`). Dispatch them BEFORE `Config::discover` so
+    // users with a malformed `kb-mcp.toml` in CWD can still recover by
+    // running `kb-mcp service uninstall` (otherwise discover would error out
+    // before reaching the service arm).
+    if let Commands::Service { action } = cli.command {
+        return run_service(action);
+    }
+
     let (cfg, source) = Config::discover(cli.config.as_deref())?;
     tracing::info!(
         target: "kb_mcp::config",
@@ -899,8 +951,58 @@ fn main() -> anyhow::Result<()> {
                 std::process::exit(1);
             }
         }
+        Commands::Service { .. } => {
+            // Dispatched at the top of main() before Config::discover
+            // (codex P2 round 3 on PR #56). Unreachable here.
+            unreachable!("Commands::Service dispatched before Config::discover");
+        }
     }
 
+    Ok(())
+}
+
+/// Service subcommand dispatcher. Called from `main()` BEFORE
+/// `Config::discover` so users with a malformed `kb-mcp.toml` in CWD can
+/// still uninstall / inspect existing service registrations.
+fn run_service(action: ServiceSubcommand) -> anyhow::Result<()> {
+    match action {
+        ServiceSubcommand::Install {
+            service_name,
+            kb_path,
+            bind,
+            no_auto_start,
+            force,
+            i_know_non_loopback,
+        } => {
+            kb_mcp::service::install::run(kb_mcp::service::install::InstallParams {
+                service_name,
+                kb_path,
+                bind,
+                auto_start: !no_auto_start,
+                force,
+                i_know_non_loopback,
+            })?;
+        }
+        ServiceSubcommand::Uninstall {
+            service_name,
+            purge,
+            yes,
+        } => {
+            kb_mcp::service::uninstall::run(kb_mcp::service::uninstall::UninstallParams {
+                service_name,
+                purge,
+                yes,
+            })?;
+        }
+        ServiceSubcommand::Status { service_name } => {
+            let text = kb_mcp::service::status::run_status(&service_name)?;
+            eprintln!("{}", text);
+        }
+        ServiceSubcommand::List => {
+            let text = kb_mcp::service::status::run_list()?;
+            eprintln!("{}", text);
+        }
+    }
     Ok(())
 }
 
