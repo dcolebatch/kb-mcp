@@ -293,7 +293,12 @@ The installer writes a config home at `<dirs::config_dir()>/kb-mcp/<service-name
 
 Non-loopback bind addresses (e.g. `0.0.0.0:3100`) require `--i-know` since kb-mcp has no authentication.
 
-> **Migration from v0.7.x personal-http recipe**: The `examples/deployments/personal-http/` templates were removed in v0.8.0. If you have a manually installed unit at `~/.config/systemd/user/kb-mcp.service` (or equivalent macOS/Windows path), run `systemctl --user disable kb-mcp.service && rm ~/.config/systemd/user/kb-mcp.service` (or platform equivalent) before running `kb-mcp service install`.
+> **Migration from v0.7.x personal-http recipe**: The `examples/deployments/personal-http/` templates were removed in v0.8.0. Disable / delete the manually installed unit before running `kb-mcp service install`:
+> - Linux: `systemctl --user disable kb-mcp.service && rm ~/.config/systemd/user/kb-mcp.service`
+> - macOS: `launchctl bootout gui/<uid>/com.kb-mcp.kb-mcp && rm ~/Library/LaunchAgents/com.kb-mcp.kb-mcp.plist`
+> - Windows: `schtasks /End /TN '\kb-mcp' ; schtasks /Delete /TN '\kb-mcp' /F` (replace `\kb-mcp` with whatever name the old task used)
+>
+> If you're carrying settings over from the old `kb-mcp.toml` (e.g. `model = "bge-m3"`, `exclude_dirs`, `best_practice`, `fastembed_cache_dir`), edit the **new** config at `<dirs::config_dir()>/kb-mcp/<service-name>/kb-mcp.toml` after install. **`kb_path` must be an absolute path** — the new daemon's `WorkingDirectory` is `config_home`, so a relative `kb_path = "./knowledge-base"` will resolve to `<config_home>/knowledge-base` and miss the real KB. Use TOML literal strings (single quotes) to avoid Windows backslash escapes: `kb_path = 'C:\Users\you\your-kb'`.
 
 ### Show index status
 
