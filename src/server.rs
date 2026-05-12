@@ -52,6 +52,10 @@ pub struct KbServer {
     /// の per-call override 解決時に `SearchOverrides::resolve(&search_config)`
     /// で参照する。toml に section が無ければ `SearchConfig::default()` (MMR off)。
     search_config: crate::config::SearchConfig,
+    /// Shared indexing-state slot — `rebuild_index` flips it Some/None so
+    /// `/api/admin/status` (= `KbServerShared.indexing_state`) reflects the
+    /// in-process index operation (codex P2 round 1 on PR #57).
+    indexing_state: Arc<Mutex<Option<IndexingState>>>,
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
 }
@@ -284,7 +288,7 @@ impl KbServer {
         name = "search",
         description = "Hybrid search (vector + FTS5 full-text, merged via Reciprocal Rank Fusion) over the knowledge base. Returns a wrapper with results, low_confidence flag, and filter_applied echo. The `score` field is the RRF score (or cross-encoder score when reranker is enabled). `match_spans` field (when present) gives byte offsets into `content` for ASCII query terms."
     )]
-    async fn search(&self, Parameters(params): Parameters<SearchParams>) -> String {
+    pub(crate) async fn search(&self, Parameters(params): Parameters<SearchParams>) -> String {
         let limit = params.limit.unwrap_or(5);
 
         // feature-28 Task 2.7: per-call MMR override の範囲チェック。
@@ -626,6 +630,39 @@ impl KbServer {
     )]
     async fn rebuild_index(&self, Parameters(params): Parameters<RebuildIndexParams>) -> String {
         let force = params.force.unwrap_or(false);
+
+        // codex P2 round 1 + P2 round 4 on PR #57: flip `indexing_state` to
+        // `Some` while the rebuild runs so `/api/admin/status` reports
+        // indexing.active=true. Use a refcount (`active_count`) so concurrent
+        // rebuild_index calls don't clear each other's state — first caller
+        // sets Some(count=1), subsequent callers ++count; on Drop, --count
+        // and clear the slot to None only when reaching 0.
+        struct IndexingGuard(Arc<Mutex<Option<IndexingState>>>);
+        impl Drop for IndexingGuard {
+            fn drop(&mut self) {
+                if let Ok(mut guard) = self.0.lock()
+                    && let Some(s) = guard.as_mut()
+                {
+                    s.active_count = s.active_count.saturating_sub(1);
+                    if s.active_count == 0 {
+                        *guard = None;
+                    }
+                }
+            }
+        }
+        if let Ok(mut guard) = self.indexing_state.lock() {
+            match guard.as_mut() {
+                Some(s) => s.active_count += 1,
+                None => {
+                    *guard = Some(IndexingState {
+                        started_at: std::time::SystemTime::now(),
+                        progress: None,
+                        active_count: 1,
+                    });
+                }
+            }
+        }
+        let _indexing_guard = IndexingGuard(Arc::clone(&self.indexing_state));
 
         // Lock order: embedder first, then db (consistent with search)
         let mut embedder = self.embedder.lock().unwrap();
@@ -1300,6 +1337,43 @@ pub struct KbServerShared {
     /// `[search]` セクション (toml) のスナップショット。serve 起動時に Config
     /// から取り出し、shutdown まで不変。`KbServer::from_shared` で clone する。
     pub search_config: crate::config::SearchConfig,
+
+    // (v0.8.0+, feature-43 PR-2) Fields surfaced by `/api/admin/status`.
+    /// Wall-clock daemon start time, used for ISO formatting in admin status.
+    pub started_at: std::time::SystemTime,
+    /// Monotonic daemon start time, used for uptime calculation (NTP-jump safe).
+    pub started_instant: std::time::Instant,
+    /// Current indexing operation state, or `None` when idle.
+    pub indexing_state: std::sync::Arc<std::sync::Mutex<Option<IndexingState>>>,
+    /// `true` while the file watcher loop is running.
+    pub watcher_active: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Watcher debounce window (= `[watch].debounce_ms` from config).
+    pub watcher_debounce_ms: u64,
+    /// Human-readable label of which source `Config::discover()` used.
+    /// e.g. "Explicit" / "Cwd" / "GitRoot" / "AlongsideBinary" / "NotFound".
+    pub config_source_label: String,
+    /// Hosts allowed by the admin sub-router Host header check.
+    /// Always includes the loopback aliases; HTTP transport also adds its bind addr.
+    pub allowed_admin_hosts: Vec<String>,
+}
+
+#[derive(Debug)]
+pub struct IndexingState {
+    pub started_at: std::time::SystemTime,
+    pub progress: Option<IndexingProgress>,
+    /// (codex P2 round 4 on PR #57) Concurrent rebuild_index refcount.
+    /// Two HTTP clients can both reach `rebuild_index` before the first
+    /// finishes — without a refcount, the first caller's Drop guard would
+    /// clear the shared slot while the second is still running. Now: start
+    /// = `Some(count=1)` or `+=1` on existing; drop = `-=1` and clear to
+    /// `None` only when reaching 0.
+    pub active_count: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct IndexingProgress {
+    pub current: u64,
+    pub total: u64,
 }
 
 impl KbServer {
@@ -1319,7 +1393,104 @@ impl KbServer {
             parser_registry: Arc::clone(&shared.parser_registry),
             min_confidence_ratio: shared.min_confidence_ratio,
             search_config: shared.search_config.clone(),
+            indexing_state: Arc::clone(&shared.indexing_state),
             tool_router: KbServer::tool_router(),
+        }
+    }
+}
+
+/// (feature-43 PR-2) Snapshot of KB-level info for the admin
+/// `/api/admin/status` endpoint. Counts are `Option` because `rebuild_index`
+/// holds the db / embedder mutex for the duration of the rebuild, so a
+/// concurrent admin-status request must not block — it returns `None` to
+/// signal "unavailable, retry after indexing completes" (codex P2 round 2
+/// on PR #57).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct KbInfo {
+    pub path: String,
+    pub documents: Option<u64>,
+    pub chunks: Option<u64>,
+    pub model: Option<String>,
+}
+
+impl KbServerShared {
+    /// (feature-43 PR-2) Best-effort snapshot of KB stats. Uses `try_lock`
+    /// on `db` / `embedder` so a long-running `rebuild_index` does not stall
+    /// the admin status response — busy locks yield `None` instead of waiting.
+    pub fn kb_info(&self) -> Result<KbInfo> {
+        let (documents, chunks) = match self.db.try_lock() {
+            Ok(db) => {
+                let docs = db.document_count().ok().map(|n| n as u64);
+                let chks = db.chunk_count().ok().map(|n| n as u64);
+                (docs, chks)
+            }
+            Err(_) => (None, None),
+        };
+        let model = self
+            .embedder
+            .try_lock()
+            .ok()
+            .map(|e| e.model_id().to_string());
+        Ok(KbInfo {
+            path: self.kb_path.display().to_string(),
+            documents,
+            chunks,
+            model,
+        })
+    }
+}
+
+/// (feature-43 PR-2) Plain-JSON search entry for the WebUI `/api/search` POST.
+///
+/// Constructs a minimal `SearchParams` (= query + limit only) and dispatches
+/// through the same `KbServer::search` tool method the MCP clients use.
+/// Returns the raw JSON string from `KbServer::search` (already
+/// pretty-printed `SearchResponse` or `ErrorResponse`).
+///
+/// Defined as a free function (instead of a method on `KbServerShared`) so
+/// the private `SearchParams` type does not need to leak to the public API
+/// of `KbServerShared`. Same-module access to `SearchParams` + `pub(crate)`
+/// `KbServer::search` keeps the MCP tool surface untouched.
+pub async fn web_search(shared: &KbServerShared, query: String, limit: Option<u32>) -> String {
+    let kb_server = KbServer::from_shared(shared);
+    let params = SearchParams {
+        query,
+        limit,
+        ..Default::default()
+    };
+    kb_server.search(Parameters(params)).await
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+impl KbServerShared {
+    /// (feature-43 PR-2) Test-only minimal constructor. Production code paths
+    /// go through `run_server`; this helper exists so integration tests can
+    /// build a `KbServerShared` without booting the full transport stack.
+    /// All non-essential fields are filled with defaults (loopback-only admin
+    /// allow-list, no reranker, no watcher).
+    pub fn for_test(db: Database, embedder: Embedder, kb_path: PathBuf) -> Self {
+        use std::sync::atomic::AtomicBool;
+        use std::time::{Instant, SystemTime};
+        Self {
+            db: Arc::new(Mutex::new(db)),
+            embedder: Arc::new(Mutex::new(embedder)),
+            reranker: Arc::new(Mutex::new(None)),
+            rerank_by_default: false,
+            kb_path,
+            exclude_headings: None,
+            exclude_dirs: vec![],
+            quality_threshold: 0.0,
+            best_practice_templates: vec![],
+            parser_registry: Arc::new(Registry::default()),
+            min_confidence_ratio: 1.5,
+            search_config: crate::config::SearchConfig::default(),
+            started_at: SystemTime::now(),
+            started_instant: Instant::now(),
+            indexing_state: Arc::new(Mutex::new(None)),
+            watcher_active: Arc::new(AtomicBool::new(false)),
+            watcher_debounce_ms: 500,
+            config_source_label: "TestStub".into(),
+            allowed_admin_hosts: vec!["127.0.0.1".into(), "::1".into(), "localhost".into()],
         }
     }
 }
@@ -1340,7 +1511,11 @@ pub async fn run_server(
     transport: crate::transport::Transport,
     min_confidence_ratio: f32,
     search_config: crate::config::SearchConfig,
+    config_source: crate::config::ConfigSource,
 ) -> Result<()> {
+    use std::sync::atomic::AtomicBool;
+    use std::time::{Instant, SystemTime};
+
     let db_path = crate::resolve_db_path(kb_path);
     let db = Database::open(&db_path.to_string_lossy())?;
 
@@ -1352,6 +1527,37 @@ pub async fn run_server(
     let kb_path = kb_path
         .canonicalize()
         .unwrap_or_else(|_| kb_path.to_path_buf());
+
+    // (feature-43 PR-2) prepare admin/status auxiliary state before the
+    // KbServerShared literal so we can pass an Arc::clone into the watcher.
+    let watcher_active = Arc::new(AtomicBool::new(false));
+    let watcher_debounce_ms = watch_config.debounce_ms;
+    let allowed_admin_hosts = {
+        let mut hosts = vec![
+            "127.0.0.1".to_string(),
+            "::1".to_string(),
+            "localhost".to_string(),
+        ];
+        // codex P1 round 4 on PR #57: only include the bind addr when it is
+        // a loopback IP. Otherwise a non-loopback bind (e.g. 192.168.1.10:3100
+        // or 0.0.0.0:3100) would let LAN browsers reach /ui + /api/admin/status
+        // via the bind addr Host header — that contradicts the spec § 7
+        // "admin is loopback-only" decision and the install-time Note that
+        // promises LAN browsers see 403.
+        if let crate::transport::Transport::Http { addr, .. } = &transport
+            && addr.ip().is_loopback()
+        {
+            let bind_str = addr.to_string();
+            let ip_str = addr.ip().to_string();
+            if !hosts.contains(&bind_str) {
+                hosts.push(bind_str);
+            }
+            if !hosts.contains(&ip_str) {
+                hosts.push(ip_str);
+            }
+        }
+        hosts
+    };
 
     // watcher と共有するため Arc 化。
     // HTTP service factory でも共有するため KbServerShared にまとめる。
@@ -1368,6 +1574,13 @@ pub async fn run_server(
         parser_registry: Arc::new(parser_registry),
         min_confidence_ratio,
         search_config,
+        started_at: SystemTime::now(),
+        started_instant: Instant::now(),
+        indexing_state: Arc::new(Mutex::new(None)),
+        watcher_active: Arc::clone(&watcher_active),
+        watcher_debounce_ms,
+        config_source_label: format!("{:?}", config_source),
+        allowed_admin_hosts,
     };
 
     // watcher をバックグラウンドで並走。
@@ -1379,6 +1592,7 @@ pub async fn run_server(
         exclude_headings: shared.exclude_headings.clone(),
         exclude_dirs: shared.exclude_dirs.clone(),
         config: watch_config,
+        watcher_active: Arc::clone(&watcher_active),
     };
     let watcher_handle = tokio::spawn(async move {
         if let Err(e) = crate::watcher::run_watch_loop(watcher_state).await {
