@@ -4,6 +4,8 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-05-17
+
 ### Added
 
 - (feature-44 PR-1) **Workspace split**: main `kb-mcp` crate moved to `kb-mcp/`
