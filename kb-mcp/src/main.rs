@@ -536,6 +536,10 @@ fn main() -> anyhow::Result<()> {
             // serve 起動時にここから clone して KbServer に保持する。
             let search_config = cfg.search.clone().unwrap_or_default();
 
+            let timing_enabled = kb_mcp::config::InstrumentationConfig::resolve_timing_enabled(
+                &cfg.instrumentation,
+            );
+
             // evaluator 指摘 High #2: `--bind` / `--port` が指定されているのに
             // 実効 transport が Stdio なら silent ignore は footgun なので reject。
             if matches!(resolved_transport, kb_mcp::transport::Transport::Stdio)
@@ -563,6 +567,7 @@ fn main() -> anyhow::Result<()> {
                     resolved_transport,
                     min_confidence_ratio,
                     search_config,
+                    timing_enabled,
                     source,
                 )
                 .await
@@ -732,6 +737,7 @@ fn main() -> anyhow::Result<()> {
                 &filters,
                 &overrides,
                 &toml_search,
+                None,
             )?;
 
             // chunk_id を維持したまま SearchHit に変換 (Parent retriever 用)。

@@ -77,6 +77,8 @@ pub struct Config {
     pub eval: Option<EvalConfig>,
     /// `kb-mcp search` / MCP `search` ツールの設定。
     pub search: Option<SearchConfig>,
+    /// MCP tool response timing instrumentation (opt-out).
+    pub instrumentation: Option<InstrumentationConfig>,
 }
 
 /// `get_best_practice` の opt-in 設定。
@@ -183,6 +185,36 @@ impl Default for ParentRetrieverConfig {
             whole_doc_threshold_tokens: default_whole_doc_threshold(),
             max_expanded_tokens: default_max_expanded(),
         }
+    }
+}
+
+/// `[instrumentation]` セクション。MCP tool response の `timing_ms` 出力制御。
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstrumentationConfig {
+    /// When `false`, MCP tool responses omit the `timing_ms` field entirely.
+    /// Default: `true` (timing enabled).
+    #[serde(default = "default_timing_enabled")]
+    pub timing_enabled: bool,
+}
+
+fn default_timing_enabled() -> bool {
+    true
+}
+
+impl Default for InstrumentationConfig {
+    fn default() -> Self {
+        Self {
+            timing_enabled: default_timing_enabled(),
+        }
+    }
+}
+
+impl InstrumentationConfig {
+    pub fn resolve_timing_enabled(cfg: &Option<InstrumentationConfig>) -> bool {
+        cfg.as_ref()
+            .map(|i| i.timing_enabled)
+            .unwrap_or(true)
     }
 }
 

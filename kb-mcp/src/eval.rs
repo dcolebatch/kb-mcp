@@ -734,6 +734,7 @@ pub fn run(opts: &RunOpts) -> Result<EvalRun> {
             &crate::db::SearchFilters::default(),
             &opts.overrides,
             &opts.search_config,
+            None,
         )?;
 
         // chunk_id を維持したまま SearchHit に変換し、Parent retriever 段を

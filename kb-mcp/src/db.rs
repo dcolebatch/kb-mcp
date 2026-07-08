@@ -327,7 +327,7 @@ pub struct Database {
 ///
 /// HashMap iteration の非決定性に依存しないよう、tie-break で id を使い
 /// プラットフォーム / 入力順に依存しない出力を保証する (invariant #1)。
-fn rrf_topk(
+pub(crate) fn rrf_topk(
     mut scores: HashMap<i64, f32>,
     mut rows: HashMap<i64, SearchResult>,
     limit: Option<u32>,
@@ -350,6 +350,25 @@ fn rrf_topk(
             })
         })
         .collect()
+}
+
+/// Merge vector + FTS candidate lists via Reciprocal Rank Fusion.
+pub(crate) fn merge_hybrid_rrf(
+    vec_hits: Vec<(i64, SearchResult)>,
+    fts_hits: Vec<(i64, SearchResult)>,
+    limit: Option<u32>,
+) -> Vec<(i64, SearchResult)> {
+    let mut scores: HashMap<i64, f32> = HashMap::new();
+    let mut rows: HashMap<i64, SearchResult> = HashMap::new();
+    for (rank, (chunk_id, row)) in vec_hits.into_iter().enumerate() {
+        *scores.entry(chunk_id).or_insert(0.0) += 1.0 / (RRF_K + (rank as f32) + 1.0);
+        rows.entry(chunk_id).or_insert(row);
+    }
+    for (rank, (chunk_id, row)) in fts_hits.into_iter().enumerate() {
+        *scores.entry(chunk_id).or_insert(0.0) += 1.0 / (RRF_K + (rank as f32) + 1.0);
+        rows.entry(chunk_id).or_insert(row);
+    }
+    rrf_topk(scores, rows, limit)
 }
 
 impl Database {
@@ -1041,7 +1060,7 @@ impl Database {
     ///
     /// `search_vec_candidates` と同様に、category / topic フィルタが指定されて
     /// いる場合は `FILTER_OVERFETCH_FACTOR` 倍を取りに行き、Rust 側で絞り込む。
-    fn search_fts_candidates(
+    pub(crate) fn search_fts_candidates(
         &self,
         query_text: &str,
         limit: u32,
@@ -1196,19 +1215,7 @@ impl Database {
         let vec_hits = self.search_vec_candidates(query_embedding, candidates, filters)?;
         let fts_hits = self.search_fts_candidates(query_text, candidates, filters)?;
 
-        // RRF: chunk_id ごとに 1/(K + rank + 1) を加算
-        let mut scores: HashMap<i64, f32> = HashMap::new();
-        let mut rows: HashMap<i64, SearchResult> = HashMap::new();
-        for (rank, (chunk_id, row)) in vec_hits.into_iter().enumerate() {
-            *scores.entry(chunk_id).or_insert(0.0) += 1.0 / (RRF_K + (rank as f32) + 1.0);
-            rows.entry(chunk_id).or_insert(row);
-        }
-        for (rank, (chunk_id, row)) in fts_hits.into_iter().enumerate() {
-            *scores.entry(chunk_id).or_insert(0.0) += 1.0 / (RRF_K + (rank as f32) + 1.0);
-            rows.entry(chunk_id).or_insert(row);
-        }
-
-        Ok(rrf_topk(scores, rows, Some(limit)))
+        Ok(merge_hybrid_rrf(vec_hits, fts_hits, Some(limit)))
     }
 
     /// `search_hybrid_candidates` と同じ RRF を計算するが、最終 truncate を
@@ -1233,18 +1240,7 @@ impl Database {
         let vec_hits = self.search_vec_candidates(query_embedding, candidates, filters)?;
         let fts_hits = self.search_fts_candidates(query_text, candidates, filters)?;
 
-        let mut scores: HashMap<i64, f32> = HashMap::new();
-        let mut rows: HashMap<i64, SearchResult> = HashMap::new();
-        for (rank, (chunk_id, row)) in vec_hits.into_iter().enumerate() {
-            *scores.entry(chunk_id).or_insert(0.0) += 1.0 / (RRF_K + (rank as f32) + 1.0);
-            rows.entry(chunk_id).or_insert(row);
-        }
-        for (rank, (chunk_id, row)) in fts_hits.into_iter().enumerate() {
-            *scores.entry(chunk_id).or_insert(0.0) += 1.0 / (RRF_K + (rank as f32) + 1.0);
-            rows.entry(chunk_id).or_insert(row);
-        }
-
-        Ok(rrf_topk(scores, rows, None))
+        Ok(merge_hybrid_rrf(vec_hits, fts_hits, None))
     }
 
     /// RRF 用: ベクトル検索の候補を `(chunk_id, SearchResult)` で返す。
