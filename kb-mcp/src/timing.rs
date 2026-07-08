@@ -114,6 +114,7 @@ pub struct GetDocumentStageTimingMs {
     pub disk_read: u64,
     pub frontmatter_parse: u64,
     pub markdown_load: u64,
+    pub response_build: u64,
 }
 
 /// Per-stage breakdown for the `list_topics` MCP tool.

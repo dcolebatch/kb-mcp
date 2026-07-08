@@ -35,6 +35,7 @@ use serde::Deserialize;
 use tokio::sync::mpsc;
 
 use crate::db::Database;
+use crate::document_index::SharedDocumentIndex;
 use crate::embedder::Embedder;
 use crate::indexer;
 use crate::parser::Registry;
@@ -95,6 +96,8 @@ pub struct WatcherState {
     /// Set to `true` for the duration of the watch loop (feature-43 PR-2).
     /// Shared with `KbServerShared` so `/api/admin/status` can report it.
     pub watcher_active: Arc<std::sync::atomic::AtomicBool>,
+    /// In-memory document cache kept in sync with incremental index events.
+    pub document_index: SharedDocumentIndex,
 }
 
 /// `rel` (forward-slash 相対パス) が `exclude_dirs` のいずれかの配下に
@@ -389,14 +392,36 @@ fn dispatch_reindex(state: &WatcherState, rel: &str) {
     ) {
         Ok(indexer::SingleResult::Updated { chunks }) => {
             eprintln!("watcher: reindexed {rel} ({chunks} chunks)");
+            refresh_document_index_entry(state, rel);
         }
         Ok(indexer::SingleResult::Unchanged) => { /* no-op */ }
         Ok(indexer::SingleResult::Skipped { reason }) => {
             eprintln!("watcher: skipped {rel} ({reason})");
+            remove_document_index_entry(state, rel);
         }
         Err(e) => {
             eprintln!("watcher: reindex {rel} failed: {e}");
         }
+    }
+}
+
+fn refresh_document_index_entry(state: &WatcherState, rel: &str) {
+    if let Ok(mut guard) = state.document_index.write() {
+        if let Err(e) = guard.upsert_from_rel(
+            &state.kb_path,
+            rel,
+            &state.registry,
+            state.exclude_headings.as_deref(),
+            crate::document_index::GET_DOCUMENT_MAX_BYTES,
+        ) {
+            eprintln!("watcher: document index upsert {rel} failed: {e}");
+        }
+    }
+}
+
+fn remove_document_index_entry(state: &WatcherState, rel: &str) {
+    if let Ok(mut guard) = state.document_index.write() {
+        guard.remove(rel);
     }
 }
 
@@ -406,7 +431,10 @@ fn dispatch_deindex(state: &WatcherState, rel: &str) {
         return;
     };
     match indexer::deindex_single_file(&db, rel) {
-        Ok(true) => eprintln!("watcher: deindexed {rel}"),
+        Ok(true) => {
+            eprintln!("watcher: deindexed {rel}");
+            remove_document_index_entry(state, rel);
+        }
         Ok(false) => { /* no-op: not in DB */ }
         Err(e) => eprintln!("watcher: deindex {rel} failed: {e}"),
     }
@@ -432,12 +460,24 @@ fn dispatch_rename(state: &WatcherState, old_rel: &str, new_rel: &str) {
     ) {
         Ok(indexer::RenameOutcome::Renamed) => {
             eprintln!("watcher: renamed {old_rel} -> {new_rel}");
+            if let Ok(mut guard) = state.document_index.write() {
+                if !guard.rename(old_rel, new_rel) {
+                    drop(guard);
+                    refresh_document_index_entry(state, new_rel);
+                }
+            }
         }
         Ok(indexer::RenameOutcome::RenamedAndReindexed { chunks }) => {
             eprintln!("watcher: renamed+reindexed {old_rel} -> {new_rel} ({chunks} chunks)");
+            if let Ok(mut guard) = state.document_index.write() {
+                guard.remove(old_rel);
+            }
+            refresh_document_index_entry(state, new_rel);
         }
         Ok(indexer::RenameOutcome::OldPathMissing) => {
             eprintln!("watcher: rename target {old_rel} not in DB, indexed {new_rel}");
+            remove_document_index_entry(state, old_rel);
+            refresh_document_index_entry(state, new_rel);
         }
         Err(e) => eprintln!("watcher: rename {old_rel} -> {new_rel} failed: {e}"),
     }

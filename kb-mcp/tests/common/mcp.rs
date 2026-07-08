@@ -190,25 +190,26 @@ pub fn mcp_initialize(base: &str) -> String {
     after[..end].trim().trim_end_matches('\r').to_string()
 }
 
-/// POST a `tools/call` request for the `search` tool with `arguments` =
-/// the given JSON value. Returns the deserialized JSON value of the
-/// `result.content[0].text` (= the inner SearchResponse JSON our server
-/// produces).
-pub fn mcp_search_call(
+/// POST a `tools/call` request for the `get_document` tool.
+pub fn mcp_get_document_call(
     base: &str,
     session_id: &str,
-    arguments: serde_json::Value,
+    path: &str,
 ) -> serde_json::Value {
     let body = serde_json::json!({
         "jsonrpc": "2.0",
-        "id": 2,
+        "id": 3,
         "method": "tools/call",
         "params": {
-            "name": "search",
-            "arguments": arguments,
+            "name": "get_document",
+            "arguments": { "path": path },
         }
     });
-    let body_str = serde_json::to_string(&body).unwrap();
+    mcp_tool_call_inner(base, session_id, &body)
+}
+
+fn mcp_tool_call_inner(base: &str, session_id: &str, body: &serde_json::Value) -> serde_json::Value {
+    let body_str = serde_json::to_string(body).unwrap();
     let out = Command::new("curl")
         .args([
             "-s",
@@ -251,6 +252,27 @@ pub fn mcp_search_call(
         .unwrap_or_else(|| panic!("missing result.content[0].text in envelope:\n{envelope}"));
     serde_json::from_str(text)
         .unwrap_or_else(|e| panic!("inner content text is not JSON ({e}): {text}"))
+}
+
+/// POST a `tools/call` request for the `search` tool with `arguments` =
+/// the given JSON value. Returns the deserialized JSON value of the
+/// `result.content[0].text` (= the inner SearchResponse JSON our server
+/// produces).
+pub fn mcp_search_call(
+    base: &str,
+    session_id: &str,
+    arguments: serde_json::Value,
+) -> serde_json::Value {
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {
+            "name": "search",
+            "arguments": arguments,
+        }
+    });
+    mcp_tool_call_inner(base, session_id, &body)
 }
 
 /// Run `kb-mcp index` against the given KB so the SQLite + vec index is

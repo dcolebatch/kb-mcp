@@ -59,17 +59,22 @@ Example excerpt:
 }
 ```
 
-If `embedding_generation` dominates, the embedder or model choice is the bottleneck. If `sqlite_fts` / `vector_search` dominate, inspect index size and filters. A high `get_document` `disk_read` with `cache_lookup: 0` points at cold disk I/O (no document cache yet).
+If `embedding_generation` dominates, the embedder or model choice is the bottleneck. If `sqlite_fts` / `vector_search` dominate, inspect index size and filters. A high `get_document` `disk_read` with `cache_lookup: 0` points at cold disk I/O (document missing from the in-memory index).
 
 ## `get_document` tool — additional fields
 
+`get_document(path)` is **deterministic direct retrieval**: it looks up the canonical relative path in an in-memory document index built at server startup (and kept in sync by `rebuild_index` / the file watcher). It does not run the search pipeline, generate embeddings, or touch sqlite-vec.
+
 | Field | Stage |
 |-------|-------|
-| `document_lookup` | Path validation / canonicalization |
-| `cache_lookup` | In-memory cache probe (0 until a cache exists) |
-| `disk_read` | `read_to_string` when served from disk |
-| `frontmatter_parse` | Parser / markdown frontmatter extraction |
-| `markdown_load` | Building the response struct |
+| `document_lookup` | Path key validation (no disk I/O) |
+| `cache_lookup` | In-memory index probe |
+| `disk_read` | Always `0` on the hot path (served from memory) |
+| `frontmatter_parse` | Always `0` on the hot path (parsed at index time) |
+| `markdown_load` | Legacy field; always `0` when served from cache |
+| `response_build` | Assembling the JSON response from the cached entry |
+
+Latency regression test: `cargo test --test document_index_integration -- --ignored` (reports median/p95 over 20 repeated fetches).
 
 ## `list_topics` tool
 
