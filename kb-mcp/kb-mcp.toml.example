@@ -128,6 +128,12 @@ bind = "127.0.0.1:3100"
 #k_values = [1, 5, 10]                  # 報告する k (default: [1, 5, 10])
 #regression_threshold = 0.05            # diff 色付けの閾値 (default: 0.05)
 
+# --- instrumentation (MCP response timing) ---
+# MCP tool responses include a timing_ms breakdown by default.
+# Omit timing output by setting timing_enabled to false in this section.
+[instrumentation]
+#timing_enabled = true
+
 # --- search (search ツール追加設定、v0.3.0+) ---
 # rank-based low_confidence 判定の閾値。top1.score / mean(top-N.score) <
 # ratio で flag が立つ。0.0 で判定無効。CLI `--min-confidence-ratio` /

@@ -12,6 +12,11 @@ use crate::db::{Database, SearchHit};
 use crate::embedder::{Embedder, ModelChoice, Reranker, RerankerChoice};
 use crate::graph::{self, GraphOptions, SeedStrategy};
 use crate::parser::Registry;
+use crate::timing::{
+    encode_error_with_timing, encode_with_timing, GenericToolTimingMs, GetDocumentStageTimingMs,
+    ListTopicsStageTimingMs, SearchPipelineTiming, SearchStageTimingMs, StageTimer,
+    ToolRequestTimer,
+};
 use crate::{indexer, markdown};
 
 // ---------------------------------------------------------------------------
@@ -56,6 +61,8 @@ pub struct KbServer {
     /// `/api/admin/status` (= `KbServerShared.indexing_state`) reflects the
     /// in-process index operation (codex P2 round 1 on PR #57).
     indexing_state: Arc<Mutex<Option<IndexingState>>>,
+    /// When false, MCP tool responses omit `timing_ms`.
+    timing_enabled: bool,
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
 }
@@ -242,6 +249,11 @@ struct IndexStats {
     duration_ms: u64,
 }
 
+#[derive(Serialize)]
+struct ListTopicsResponse {
+    topics: Vec<TopicEntry>,
+}
+
 #[derive(Serialize, Debug)]
 pub(crate) struct ErrorResponse {
     error: String,
@@ -282,6 +294,65 @@ struct SearchFilterEcho {
 // Tool implementations
 // ---------------------------------------------------------------------------
 
+fn tool_error(timing_enabled: bool, timer: &ToolRequestTimer, error: String) -> String {
+    if !timing_enabled {
+        return serde_json::to_string_pretty(&ErrorResponse { error }).unwrap_or_default();
+    }
+    let ser_timer = StageTimer::start();
+    let timing = GenericToolTimingMs {
+        base: timer.finish(ser_timer.elapsed_ms()),
+    };
+    encode_error_with_timing(true, &error, timing)
+}
+
+fn search_error(
+    timing_enabled: bool,
+    timer: &ToolRequestTimer,
+    stages: SearchStageTimingMs,
+    error: String,
+) -> String {
+    if !timing_enabled {
+        return serde_json::to_string_pretty(&ErrorResponse { error }).unwrap_or_default();
+    }
+    let ser_timer = StageTimer::start();
+    let mut stages = stages;
+    stages.base = timer.finish(ser_timer.elapsed_ms());
+    encode_error_with_timing(true, &error, stages)
+}
+
+fn finalize_tool_json<T: serde::Serialize, G: serde::Serialize>(
+    timing_enabled: bool,
+    timer: &ToolRequestTimer,
+    body: &T,
+    timing: G,
+) -> String {
+    if !timing_enabled {
+        return serde_json::to_string_pretty(body).unwrap_or_default();
+    }
+    let ser_timer = StageTimer::start();
+    let out = encode_with_timing(true, body, &timing);
+    let serialization_ms = ser_timer.elapsed_ms();
+    let mut value: serde_json::Value =
+        serde_json::from_str(&out).unwrap_or(serde_json::Value::Null);
+    if let Some(timing_obj) = value.get_mut("timing_ms").and_then(|v| v.as_object_mut()) {
+        let base = timer.finish(serialization_ms);
+        timing_obj.insert("total".into(), base.total.into());
+        timing_obj.insert("request_parse".into(), base.request_parse.into());
+        timing_obj.insert("routing".into(), base.routing.into());
+        timing_obj.insert("tool_execution".into(), base.tool_execution.into());
+        timing_obj.insert("serialization".into(), base.serialization.into());
+    }
+    serde_json::to_string_pretty(&value).unwrap_or(out)
+}
+
+fn finish_generic_tool_json<T: serde::Serialize>(
+    timing_enabled: bool,
+    timer: &ToolRequestTimer,
+    body: &T,
+) -> String {
+    finalize_tool_json(timing_enabled, timer, body, GenericToolTimingMs::default())
+}
+
 #[tool_router(server_handler)]
 impl KbServer {
     #[tool(
@@ -289,71 +360,81 @@ impl KbServer {
         description = "Hybrid search (vector + FTS5 full-text, merged via Reciprocal Rank Fusion) over the knowledge base. Returns a wrapper with results, low_confidence flag, and filter_applied echo. The `score` field is the RRF score (or cross-encoder score when reranker is enabled). `match_spans` field (when present) gives byte offsets into `content` for ASCII query terms."
     )]
     pub(crate) async fn search(&self, Parameters(params): Parameters<SearchParams>) -> String {
+        let mut request_timer = ToolRequestTimer::start();
+        let mut stages = SearchStageTimingMs::default();
         let limit = params.limit.unwrap_or(5);
 
-        // feature-28 Task 2.7: per-call MMR override の範囲チェック。
-        // 1.5 / -0.1 等の outside-range は MCP boundary で early reject し、
-        // resolve / mmr_select に届ける前に弾く。NaN も `(0.0..=1.0).contains`
-        // が false になるので同経路で reject される。
         if let Some(l) = params.mmr_lambda
             && !(0.0..=1.0).contains(&l)
         {
-            return serde_json::to_string_pretty(&ErrorResponse {
-                error: format!("mmr_lambda out of range: {l} (must be 0.0..=1.0)"),
-            })
-            .unwrap_or_default();
+            request_timer.mark_parse_done();
+            return search_error(
+                self.timing_enabled,
+                &request_timer,
+                stages,
+                format!("mmr_lambda out of range: {l} (must be 0.0..=1.0)"),
+            );
         }
         if let Some(p) = params.mmr_same_doc_penalty
             && !(0.0..=1.0).contains(&p)
         {
-            return serde_json::to_string_pretty(&ErrorResponse {
-                error: format!("mmr_same_doc_penalty out of range: {p} (must be 0.0..=1.0)"),
-            })
-            .unwrap_or_default();
+            request_timer.mark_parse_done();
+            return search_error(
+                self.timing_enabled,
+                &request_timer,
+                stages,
+                format!("mmr_same_doc_penalty out of range: {p} (must be 0.0..=1.0)"),
+            );
         }
 
-        // F-35: query length cap (1 KiB)。上限超えは early reject。
-        // embedder / FTS5 layer の内部 truncate に任せる手もあるが、上流で
-        // reject した方が「なぜ結果が変なのか」分かりやすく、`compute_match_spans`
-        // の O(N×M) cost も query 側から抑制できる。
         if params.query.len() > SEARCH_QUERY_MAX_BYTES {
-            return serde_json::to_string_pretty(&ErrorResponse {
-                error: format!(
+            request_timer.mark_parse_done();
+            return search_error(
+                self.timing_enabled,
+                &request_timer,
+                stages,
+                format!(
                     "query is too large: {} bytes (max {SEARCH_QUERY_MAX_BYTES} bytes). \
                      For long-form retrieval, slice the query or use multiple smaller calls.",
                     params.query.len()
                 ),
-            })
-            .unwrap_or_default();
+            );
         }
 
-        // path_globs を事前 compile。エラー時は ErrorResponse を返却。
         let cpg = match params.path_globs.as_ref() {
             Some(globs) => match compile_path_globs(globs) {
                 Ok(c) => Some(c),
                 Err(e) => {
-                    return serde_json::to_string_pretty(&ErrorResponse {
-                        error: format!("invalid path_globs: {e}"),
-                    })
-                    .unwrap_or_default();
+                    request_timer.mark_parse_done();
+                    return search_error(
+                        self.timing_enabled,
+                        &request_timer,
+                        stages,
+                        format!("invalid path_globs: {e}"),
+                    );
                 }
             },
             None => None,
         };
+        request_timer.mark_parse_done();
 
-        // query embedding
+        let embed_timer = StageTimer::start();
         let query_embedding = {
             let mut embedder = self.embedder.lock().unwrap();
             match embedder.embed_single(&params.query) {
                 Ok(emb) => emb,
                 Err(e) => {
-                    return serde_json::to_string_pretty(&ErrorResponse {
-                        error: format!("Failed to embed query: {e}"),
-                    })
-                    .unwrap_or_default();
+                    stages.embedding_generation = embed_timer.elapsed_ms();
+                    return search_error(
+                        self.timing_enabled,
+                        &request_timer,
+                        stages,
+                        format!("Failed to embed query: {e}"),
+                    );
                 }
             }
         };
+        stages.embedding_generation = embed_timer.elapsed_ms();
 
         let mut reranker_guard = self.reranker.lock().unwrap();
         let use_rerank =
@@ -396,6 +477,7 @@ impl KbServer {
             None
         };
 
+        let mut pipeline_timing = SearchPipelineTiming::default();
         let after_mmr = match run_search_pipeline(
             &db,
             reranker_arg,
@@ -405,15 +487,28 @@ impl KbServer {
             &filters,
             &overrides,
             &self.search_config,
+            Some(&mut pipeline_timing),
         ) {
             Ok(r) => r,
             Err(e) => {
-                return serde_json::to_string_pretty(&ErrorResponse {
-                    error: format!("Search failed: {e}. Try running rebuild_index first."),
-                })
-                .unwrap_or_default();
+                stages.sqlite_fts = pipeline_timing.sqlite_fts;
+                stages.vector_search = pipeline_timing.vector_search;
+                stages.reciprocal_rank_fusion = pipeline_timing.reciprocal_rank_fusion;
+                stages.reranker = pipeline_timing.reranker;
+                stages.mmr = pipeline_timing.mmr;
+                return search_error(
+                    self.timing_enabled,
+                    &request_timer,
+                    stages,
+                    format!("Search failed: {e}. Try running rebuild_index first."),
+                );
             }
         };
+        stages.sqlite_fts = pipeline_timing.sqlite_fts;
+        stages.vector_search = pipeline_timing.vector_search;
+        stages.reciprocal_rank_fusion = pipeline_timing.reciprocal_rank_fusion;
+        stages.reranker = pipeline_timing.reranker;
+        stages.mmr = pipeline_timing.mmr;
 
         // chunk_id を維持したまま SearchHit に変換 (Parent retriever 用)。
         // Parent retriever は relevance を変えないので scores は元 chunk
@@ -436,27 +531,29 @@ impl KbServer {
             }
             None => self.min_confidence_ratio,
         };
+        let filter_timer = StageTimer::start();
         let low_confidence = compute_low_confidence(&scores, effective_ratio);
 
-        // Parent retriever 段。enabled = false なら chunk_id を剥がすだけで
-        // content / expanded_from は触らない (= v0.6.1 と bit-exact 互換)。
         let resolved = overrides.resolve(&self.search_config);
         let parent_params = crate::parent::ParentRetrieverParams {
             whole_doc_threshold_tokens: resolved.parent_whole_doc_threshold_tokens,
             max_expanded_tokens: resolved.parent_max_expanded_tokens,
         };
+        let parent_timer = StageTimer::start();
         let mut hits: Vec<SearchHit> = crate::parent::apply_parent_retriever(
             hits_with_id,
             &db,
             resolved.parent_retriever_enabled,
             parent_params,
         );
-        // match_spans は Parent retriever 拡張後の content に対して計算する
-        // (`expand_parent` は defensive に None クリアするので必ず再計算が要る)。
+        stages.parent_retriever = parent_timer.elapsed_ms();
+
         for h in &mut hits {
             h.match_spans = compute_match_spans(&params.query, &h.content);
         }
+        stages.result_filtering = filter_timer.elapsed_ms();
 
+        let build_timer = StageTimer::start();
         let echo = SearchFilterEcho {
             category: params.category.clone(),
             topic: params.topic.clone(),
@@ -473,7 +570,14 @@ impl KbServer {
             low_confidence,
             filter_applied: echo,
         };
-        serde_json::to_string_pretty(&resp).unwrap_or_default()
+        stages.response_build = build_timer.elapsed_ms();
+
+        finalize_tool_json(
+            self.timing_enabled,
+            &request_timer,
+            &resp,
+            stages,
+        )
     }
 
     #[tool(
@@ -481,9 +585,16 @@ impl KbServer {
         description = "List all indexed topics and categories with document counts."
     )]
     async fn list_topics(&self) -> String {
+        let mut request_timer = ToolRequestTimer::start();
+        request_timer.mark_parse_done();
+        let mut stages = ListTopicsStageTimingMs::default();
+
+        let lookup_timer = StageTimer::start();
         let db = self.db.lock().unwrap();
         match db.list_topics() {
             Ok(topics) => {
+                stages.topic_index_lookup = lookup_timer.elapsed_ms();
+                let build_timer = StageTimer::start();
                 let entries: Vec<TopicEntry> = topics
                     .into_iter()
                     .map(|t| TopicEntry {
@@ -494,12 +605,20 @@ impl KbServer {
                         titles: t.titles,
                     })
                     .collect();
-                serde_json::to_string_pretty(&entries).unwrap_or_default()
+                let resp = ListTopicsResponse { topics: entries };
+                stages.response_build = build_timer.elapsed_ms();
+                finalize_tool_json(
+                    self.timing_enabled,
+                    &request_timer,
+                    &resp,
+                    stages,
+                )
             }
-            Err(e) => serde_json::to_string_pretty(&ErrorResponse {
-                error: format!("Failed to list topics: {e}"),
-            })
-            .unwrap_or_default(),
+            Err(e) => tool_error(
+                    self.timing_enabled,
+                    &request_timer,
+                    format!("Failed to list topics: {e}"),
+                ),
         }
     }
 
@@ -508,6 +627,12 @@ impl KbServer {
         description = "Get the full content and metadata of a document by its relative path within knowledge-base/."
     )]
     async fn get_document(&self, Parameters(params): Parameters<GetDocumentParams>) -> String {
+        let mut request_timer = ToolRequestTimer::start();
+        request_timer.mark_parse_done();
+        let mut stages = GetDocumentStageTimingMs::default();
+        stages.cache_lookup = 0;
+
+        let lookup_timer = StageTimer::start();
         let canonical = match validate_get_document_path(
             &self.kb_path,
             &params.path,
@@ -516,22 +641,47 @@ impl KbServer {
         ) {
             ValidatePathOutcome::Found(p) => p,
             ValidatePathOutcome::NotFound(e) => {
-                return serde_json::to_string_pretty(&e).unwrap_or_default();
+                return tool_error(self.timing_enabled, &request_timer, e.error);
             }
             ValidatePathOutcome::Denied(e) => {
-                return serde_json::to_string_pretty(&e).unwrap_or_default();
+                return tool_error(self.timing_enabled, &request_timer, e.error);
             }
         };
+        stages.document_lookup = lookup_timer.elapsed_ms();
+
         let ext = canonical.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let disk_timer = StageTimer::start();
         match std::fs::read_to_string(&canonical) {
             Ok(raw) => {
-                let resp = build_document_response(&self.parser_registry, &params.path, ext, raw);
-                serde_json::to_string_pretty(&resp).unwrap_or_default()
+                stages.disk_read = disk_timer.elapsed_ms();
+                let parse_timer = StageTimer::start();
+                let parsed = match self.parser_registry.by_extension(ext) {
+                    Some(p) => p.parse(&raw, &params.path, &[]),
+                    None => markdown::parse(&raw),
+                };
+                stages.frontmatter_parse = parse_timer.elapsed_ms();
+                let load_timer = StageTimer::start();
+                let resp = DocumentResponse {
+                    path: params.path.clone(),
+                    title: parsed.frontmatter.title,
+                    date: parsed.frontmatter.date,
+                    topic: parsed.frontmatter.topic,
+                    tags: parsed.frontmatter.tags,
+                    content: raw,
+                };
+                stages.markdown_load = load_timer.elapsed_ms();
+                finalize_tool_json(
+                    self.timing_enabled,
+                    &request_timer,
+                    &resp,
+                    stages,
+                )
             }
-            Err(e) => serde_json::to_string_pretty(&ErrorResponse {
-                error: format!("Failed to read file: {e}"),
-            })
-            .unwrap_or_default(),
+            Err(e) => tool_error(
+                    self.timing_enabled,
+                    &request_timer,
+                    format!("Failed to read file: {e}"),
+                ),
         }
     }
 
@@ -543,11 +693,14 @@ impl KbServer {
         &self,
         Parameters(params): Parameters<GetBestPracticeParams>,
     ) -> String {
+        let mut request_timer = ToolRequestTimer::start();
+        request_timer.mark_parse_done();
         if self.best_practice_templates.is_empty() {
-            return serde_json::to_string_pretty(&ErrorResponse {
-                error: "get_best_practice is not configured. Add `[best_practice].path_templates` to kb-mcp.toml (for example: `path_templates = [\"best-practices/{target}/PERFECT.md\"]`) to enable this tool.".to_string(),
-            })
-            .unwrap_or_default();
+            return tool_error(
+                self.timing_enabled,
+                &request_timer,
+                "get_best_practice is not configured. Add `[best_practice].path_templates` to kb-mcp.toml (for example: `path_templates = [\"best-practices/{target}/PERFECT.md\"]`) to enable this tool.".to_string(),
+            );
         }
         let canonical = match resolve_best_practice_path(
             &self.kb_path,
@@ -558,24 +711,24 @@ impl KbServer {
         ) {
             ResolveOutcome::Found(p) => p,
             ResolveOutcome::NotFound(tried) => {
-                return serde_json::to_string_pretty(&ErrorResponse {
-                    error: format!(
+                return tool_error(
+                    self.timing_enabled,
+                    &request_timer,
+                    format!(
                         "Best-practices document for target '{}' not found. Tried: [{}]",
                         params.target,
                         tried.join(", ")
                     ),
-                })
-                .unwrap_or_default();
+                );
             }
             ResolveOutcome::Denied(err) => {
-                return serde_json::to_string_pretty(&err).unwrap_or_default();
+                return tool_error(self.timing_enabled, &request_timer, err.error);
             }
         };
 
         match std::fs::read_to_string(&canonical) {
             Ok(content) => {
                 if let Some(ref cat) = params.category {
-                    // Extract a specific h2 section
                     match extract_section(&content, cat) {
                         Some(section) => {
                             let resp = BestPracticeResponse {
@@ -583,23 +736,22 @@ impl KbServer {
                                 category: Some(cat.clone()),
                                 content: section,
                             };
-                            serde_json::to_string_pretty(&resp).unwrap_or_default()
+                            finish_generic_tool_json(self.timing_enabled, &request_timer, &resp)
                         }
                         None => {
-                            // Return available sections as guidance
                             let sections = list_h2_sections(&content);
-                            serde_json::to_string_pretty(&ErrorResponse {
-                                error: format!(
+                            return tool_error(
+                                self.timing_enabled,
+                                &request_timer,
+                                format!(
                                     "Section '{}' not found. Available sections: {}",
                                     cat,
                                     sections.join(", ")
                                 ),
-                            })
-                            .unwrap_or_default()
+                            );
                         }
                     }
                 } else {
-                    // Return TOC + full content
                     let sections = list_h2_sections(&content);
                     let resp = BestPracticeResponse {
                         target: params.target,
@@ -614,13 +766,14 @@ impl KbServer {
                             content
                         ),
                     };
-                    serde_json::to_string_pretty(&resp).unwrap_or_default()
+                    finish_generic_tool_json(self.timing_enabled, &request_timer, &resp)
                 }
             }
-            Err(e) => serde_json::to_string_pretty(&ErrorResponse {
-                error: format!("Failed to read best-practices file: {e}"),
-            })
-            .unwrap_or_default(),
+            Err(e) => tool_error(
+                self.timing_enabled,
+                &request_timer,
+                format!("Failed to read best-practices file: {e}"),
+            ),
         }
     }
 
@@ -629,6 +782,8 @@ impl KbServer {
         description = "Rebuild the search index by scanning all source files in the knowledge base (Markdown plus any other extensions enabled via `[parsers].enabled` in kb-mcp.toml)."
     )]
     async fn rebuild_index(&self, Parameters(params): Parameters<RebuildIndexParams>) -> String {
+        let mut request_timer = ToolRequestTimer::start();
+        request_timer.mark_parse_done();
         let force = params.force.unwrap_or(false);
 
         // codex P2 round 1 + P2 round 4 on PR #57: flip `indexing_state` to
@@ -687,12 +842,13 @@ impl KbServer {
                     total_chunks: result.total_chunks,
                     duration_ms: result.duration_ms,
                 };
-                serde_json::to_string_pretty(&stats).unwrap_or_default()
+                finish_generic_tool_json(self.timing_enabled, &request_timer, &stats)
             }
-            Err(e) => serde_json::to_string_pretty(&ErrorResponse {
-                error: format!("Rebuild failed: {e}"),
-            })
-            .unwrap_or_default(),
+            Err(e) => tool_error(
+                self.timing_enabled,
+                &request_timer,
+                format!("Rebuild failed: {e}"),
+            ),
         }
     }
 
@@ -707,7 +863,7 @@ impl KbServer {
         &self,
         Parameters(params): Parameters<GetConnectionGraphParams>,
     ) -> String {
-        // パラメータ検証 + 上限クランプ
+        let mut request_timer = ToolRequestTimer::start();
         let depth = params
             .depth
             .unwrap_or(graph::DEFAULT_DEPTH)
@@ -724,14 +880,17 @@ impl KbServer {
             Some("centroid") => SeedStrategy::Centroid,
             Some("all_chunks") | None => SeedStrategy::AllChunks,
             Some(other) => {
-                return serde_json::to_string_pretty(&ErrorResponse {
-                    error: format!(
+                request_timer.mark_parse_done();
+                return tool_error(
+                    self.timing_enabled,
+                    &request_timer,
+                    format!(
                         "unknown seed_strategy '{other}' (expected 'all_chunks' or 'centroid')"
                     ),
-                })
-                .unwrap_or_default();
+                );
             }
         };
+        request_timer.mark_parse_done();
 
         let opts = GraphOptions {
             depth,
@@ -747,11 +906,12 @@ impl KbServer {
 
         let db = self.db.lock().unwrap();
         match graph::build_connection_graph(&db, &params.path, &opts) {
-            Ok(g) => serde_json::to_string_pretty(&g).unwrap_or_default(),
-            Err(e) => serde_json::to_string_pretty(&ErrorResponse {
-                error: format!("get_connection_graph failed: {e}"),
-            })
-            .unwrap_or_default(),
+            Ok(g) => finish_generic_tool_json(self.timing_enabled, &request_timer, &g),
+            Err(e) => tool_error(
+                self.timing_enabled,
+                &request_timer,
+                format!("get_connection_graph failed: {e}"),
+            ),
         }
     }
 }
@@ -812,6 +972,7 @@ pub fn run_search_pipeline(
     filters: &crate::db::SearchFilters<'_>,
     overrides: &crate::config::SearchOverrides,
     toml_search: &crate::config::SearchConfig,
+    mut pipeline_timing: Option<&mut SearchPipelineTiming>,
 ) -> anyhow::Result<Vec<(i64, crate::db::SearchResult)>> {
     // Range validation. NaN は `(0.0..=1.0).contains` が false なので同経路で reject。
     if let Some(l) = overrides.mmr_lambda
@@ -828,46 +989,68 @@ pub fn run_search_pipeline(
     let resolved = overrides.resolve(toml_search);
     let use_rerank = reranker.is_some();
 
-    // 1. RRF candidate pool. MMR on → unbounded (MMR が候補プール全件から
-    //    多様化選抜、user の `limit` を反映して overfetch を計算)、reranker
-    //    on → overfetch (`limit*5.max(50)`)、どちらも off → 最小コストで
-    //    `limit` 件 (invariant #3 の bit-exact path)。
     let mmr_pool_size = limit.saturating_mul(5).max(50);
-    let candidates_pool: Vec<(i64, crate::db::SearchResult)> = if resolved.mmr_enabled {
-        db.search_hybrid_candidates_unbounded(query, query_embedding, mmr_pool_size, filters)?
-    } else if use_rerank {
-        db.search_hybrid_candidates(
-            query,
-            query_embedding,
-            limit.saturating_mul(5).max(50),
-            filters,
-        )?
-    } else {
-        db.search_hybrid_candidates(query, query_embedding, limit, filters)?
-    };
+    let candidates_pool: Vec<(i64, crate::db::SearchResult)> =
+        if pipeline_timing.is_some() {
+            let candidates = if resolved.mmr_enabled {
+                mmr_pool_size.max(50)
+            } else if use_rerank {
+                limit.saturating_mul(5).max(50)
+            } else {
+                limit
+            };
+            let truncate = if resolved.mmr_enabled {
+                None
+            } else if use_rerank {
+                None
+            } else {
+                Some(limit)
+            };
 
-    // 2. Optional reranker。MMR off の reranker 入力 limit は `limit` (元の挙動
-    //    保持)、MMR on のときは MMR 側が select するので候補プール全体を保持
-    //    する。**P1 fix**: ここで `u32::MAX` を渡すと `Vec::with_capacity(u32::MAX)`
-    //    で OOM 直行するので、候補プールサイズを上限とする
-    //    (`limit*5.max(50)` で実用上 limit に追従)。saturate cast
-    //    (`u32::try_from(...).unwrap_or(u32::MAX)`) は helper の中に押し込み済み。
+            let vec_timer = StageTimer::start();
+            let vec_hits = db.search_vec_candidates(query_embedding, candidates, filters)?;
+            let vector_search = vec_timer.elapsed_ms();
+            let fts_timer = StageTimer::start();
+            let fts_hits = db.search_fts_candidates(query, candidates, filters)?;
+            let sqlite_fts = fts_timer.elapsed_ms();
+            let rrf_timer = StageTimer::start();
+            let merged = crate::db::merge_hybrid_rrf(vec_hits, fts_hits, truncate);
+            let reciprocal_rank_fusion = rrf_timer.elapsed_ms();
+            if let Some(timing) = pipeline_timing.as_mut() {
+                timing.vector_search = vector_search;
+                timing.sqlite_fts = sqlite_fts;
+                timing.reciprocal_rank_fusion = reciprocal_rank_fusion;
+            }
+            merged
+        } else if resolved.mmr_enabled {
+            db.search_hybrid_candidates_unbounded(query, query_embedding, mmr_pool_size, filters)?
+        } else if use_rerank {
+            db.search_hybrid_candidates(
+                query,
+                query_embedding,
+                limit.saturating_mul(5).max(50),
+                filters,
+            )?
+        } else {
+            db.search_hybrid_candidates(query, query_embedding, limit, filters)?
+        };
+
     let reranker_input_limit =
         compute_reranker_input_limit(resolved.mmr_enabled, candidates_pool.len(), limit);
+    let rerank_timer = StageTimer::start();
     let reranked: Vec<(i64, crate::db::SearchResult)> = match reranker {
         Some(r) => r.rerank_candidates_with_ids(query, candidates_pool, reranker_input_limit)?,
         None => candidates_pool,
     };
+    if let Some(timing) = pipeline_timing.as_mut() {
+        timing.reranker = rerank_timer.elapsed_ms();
+    }
 
-    // 3. MMR re-rank (on の時のみ)。off なら reranked の先頭 `limit` 件を返す
-    //    (= 既存挙動 bit-exact)。
     if !resolved.mmr_enabled {
         return Ok(reranked.into_iter().take(limit as usize).collect());
     }
 
-    // MmrCandidate を構築するため chunk_id 群の embedding を一括取得。
-    // F-41 PR-2: path → documents.id の N+1 lookup は廃止、SearchResult.document_id を
-    // candidate SQL で carry 済 (rename race の unwrap_or(0) collision = F-44 も同時消失)。
+    let mmr_timer = StageTimer::start();
     let chunk_ids: Vec<i64> = reranked.iter().map(|(id, _)| *id).collect();
     let emb_map = {
         use anyhow::Context;
@@ -888,9 +1071,6 @@ pub fn run_search_pipeline(
         })
         .collect();
 
-    // mmr.rs の contract: relevance_score は [0, 1] に正規化済み前提。
-    // RRF スコアは ~0.01-0.03、cross-encoder スコアは ~[-10, 10] の arbitrary
-    // range を取るため、ここで pool 内 min-max 正規化する。
     if !mmr_cands.is_empty() {
         let (min_rel, max_rel) = mmr_cands
             .iter()
@@ -916,9 +1096,6 @@ pub fn run_search_pipeline(
         limit as usize,
     );
 
-    // mmr_cands と reranked は filter_map で skip した chunk_id が
-    // mmr_cands に存在しないので、selected の i (mmr_cands index) から
-    // chunk_id を引いて reranked に当てる方が安全。
     let by_id: std::collections::HashMap<i64, &(i64, crate::db::SearchResult)> =
         reranked.iter().map(|t| (t.0, t)).collect();
     let after_mmr: Vec<(i64, crate::db::SearchResult)> = selected
@@ -929,10 +1106,10 @@ pub fn run_search_pipeline(
         })
         .collect();
 
-    // 4. Parent retriever は呼び出し側 (`apply_parent_retriever`) が
-    //    SearchHit 化後に適用する。`run_search_pipeline` の戻り値型
-    //    (`Vec<(i64, SearchResult)>`) を変えずに 3 caller (MCP / CLI / eval)
-    //    で wiring を共有するため、ここでは noop。
+    if let Some(timing) = pipeline_timing.as_mut() {
+        timing.mmr = mmr_timer.elapsed_ms();
+    }
+
     Ok(after_mmr)
 }
 
@@ -1355,6 +1532,8 @@ pub struct KbServerShared {
     /// Hosts allowed by the admin sub-router Host header check.
     /// Always includes the loopback aliases; HTTP transport also adds its bind addr.
     pub allowed_admin_hosts: Vec<String>,
+    /// When false, MCP tool responses omit `timing_ms`.
+    pub timing_enabled: bool,
 }
 
 #[derive(Debug)]
@@ -1394,6 +1573,7 @@ impl KbServer {
             min_confidence_ratio: shared.min_confidence_ratio,
             search_config: shared.search_config.clone(),
             indexing_state: Arc::clone(&shared.indexing_state),
+            timing_enabled: shared.timing_enabled,
             tool_router: KbServer::tool_router(),
         }
     }
@@ -1491,6 +1671,7 @@ impl KbServerShared {
             watcher_debounce_ms: 500,
             config_source_label: "TestStub".into(),
             allowed_admin_hosts: vec!["127.0.0.1".into(), "::1".into(), "localhost".into()],
+            timing_enabled: true,
         }
     }
 }
@@ -1511,6 +1692,7 @@ pub async fn run_server(
     transport: crate::transport::Transport,
     min_confidence_ratio: f32,
     search_config: crate::config::SearchConfig,
+    timing_enabled: bool,
     config_source: crate::config::ConfigSource,
 ) -> Result<()> {
     use std::sync::atomic::AtomicBool;
@@ -1581,6 +1763,7 @@ pub async fn run_server(
         watcher_debounce_ms,
         config_source_label: format!("{:?}", config_source),
         allowed_admin_hosts,
+        timing_enabled,
     };
 
     // watcher をバックグラウンドで並走。
@@ -2371,7 +2554,7 @@ mod tests {
         let toml = crate::config::SearchConfig::default();
         let filters = crate::db::SearchFilters::default();
         let qe = vec![0.0_f32; 384];
-        let err = run_search_pipeline(&db, None, "q", &qe, 5, &filters, &overrides, &toml)
+        let err = run_search_pipeline(&db, None, "q", &qe, 5, &filters, &overrides, &toml, None)
             .expect_err("out-of-range lambda must error");
         assert!(
             err.to_string().contains("mmr_lambda out of range"),
@@ -2391,7 +2574,7 @@ mod tests {
         let toml = crate::config::SearchConfig::default();
         let filters = crate::db::SearchFilters::default();
         let qe = vec![0.0_f32; 384];
-        let err = run_search_pipeline(&db, None, "q", &qe, 5, &filters, &overrides, &toml)
+        let err = run_search_pipeline(&db, None, "q", &qe, 5, &filters, &overrides, &toml, None)
             .expect_err("out-of-range penalty must error");
         assert!(
             err.to_string()
@@ -2415,11 +2598,34 @@ mod tests {
         let toml = crate::config::SearchConfig::default();
         let filters = crate::db::SearchFilters::default();
         let qe = vec![0.0_f32; 384];
-        let err = run_search_pipeline(&db, None, "q", &qe, 5, &filters, &overrides, &toml)
+        let err = run_search_pipeline(&db, None, "q", &qe, 5, &filters, &overrides, &toml, None)
             .expect_err("NaN lambda must error");
         assert!(
             err.to_string().contains("mmr_lambda out of range"),
             "expected NaN lambda to be reported as out-of-range, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_search_error_includes_consistent_timing_ms() {
+        let mut timer = ToolRequestTimer::start();
+        timer.mark_parse_done();
+        let out = search_error(
+            true,
+            &timer,
+            SearchStageTimingMs::default(),
+            "query is too large".to_string(),
+        );
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["error"], "query is too large");
+        let timing = &v["timing_ms"];
+        assert!(timing.get("embedding_generation").is_some());
+        assert_eq!(
+            timing["total"].as_u64().unwrap(),
+            timing["request_parse"].as_u64().unwrap()
+                + timing["routing"].as_u64().unwrap()
+                + timing["tool_execution"].as_u64().unwrap()
+                + timing["serialization"].as_u64().unwrap()
         );
     }
 }
