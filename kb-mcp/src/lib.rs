@@ -11,6 +11,7 @@
 
 pub mod config;
 pub mod db;
+pub mod document_index;
 pub mod embedder;
 pub mod eval;
 pub mod graph;

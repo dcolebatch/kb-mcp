@@ -9,6 +9,9 @@ use rmcp::{tool, tool_router};
 use serde::{Deserialize, Serialize};
 
 use crate::db::{Database, SearchHit};
+use crate::document_index::{
+    self, normalize_rel_path, validate_rel_path_key, DocumentEntry, SharedDocumentIndex,
+};
 use crate::embedder::{Embedder, ModelChoice, Reranker, RerankerChoice};
 use crate::graph::{self, GraphOptions, SeedStrategy};
 use crate::parser::Registry;
@@ -63,6 +66,8 @@ pub struct KbServer {
     indexing_state: Arc<Mutex<Option<IndexingState>>>,
     /// When false, MCP tool responses omit `timing_ms`.
     timing_enabled: bool,
+    /// In-memory document cache for lean `get_document(path)` retrieval.
+    document_index: SharedDocumentIndex,
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
 }
@@ -219,7 +224,7 @@ struct TopicEntry {
     titles: Vec<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 struct DocumentResponse {
     path: String,
     title: Option<String>,
@@ -630,59 +635,29 @@ impl KbServer {
         let mut request_timer = ToolRequestTimer::start();
         request_timer.mark_parse_done();
         let mut stages = GetDocumentStageTimingMs::default();
-        stages.cache_lookup = 0;
 
         let lookup_timer = StageTimer::start();
-        let canonical = match validate_get_document_path(
-            &self.kb_path,
+        let lookup = match get_document_from_index(
+            &self.document_index,
             &params.path,
             &self.parser_registry,
-            GET_DOCUMENT_MAX_BYTES,
         ) {
-            ValidatePathOutcome::Found(p) => p,
-            ValidatePathOutcome::NotFound(e) => {
-                return tool_error(self.timing_enabled, &request_timer, e.error);
-            }
-            ValidatePathOutcome::Denied(e) => {
-                return tool_error(self.timing_enabled, &request_timer, e.error);
+            Ok(v) => v,
+            Err(e) => {
+                let _ = lookup_timer.elapsed_ms();
+                return tool_error(self.timing_enabled, &request_timer, e);
             }
         };
         stages.document_lookup = lookup_timer.elapsed_ms();
+        stages.cache_lookup = lookup.cache_lookup_ms;
+        stages.response_build = lookup.response_build_ms;
 
-        let ext = canonical.extension().and_then(|e| e.to_str()).unwrap_or("");
-        let disk_timer = StageTimer::start();
-        match std::fs::read_to_string(&canonical) {
-            Ok(raw) => {
-                stages.disk_read = disk_timer.elapsed_ms();
-                let parse_timer = StageTimer::start();
-                let parsed = match self.parser_registry.by_extension(ext) {
-                    Some(p) => p.parse(&raw, &params.path, &[]),
-                    None => markdown::parse(&raw),
-                };
-                stages.frontmatter_parse = parse_timer.elapsed_ms();
-                let load_timer = StageTimer::start();
-                let resp = DocumentResponse {
-                    path: params.path.clone(),
-                    title: parsed.frontmatter.title,
-                    date: parsed.frontmatter.date,
-                    topic: parsed.frontmatter.topic,
-                    tags: parsed.frontmatter.tags,
-                    content: raw,
-                };
-                stages.markdown_load = load_timer.elapsed_ms();
-                finalize_tool_json(
-                    self.timing_enabled,
-                    &request_timer,
-                    &resp,
-                    stages,
-                )
-            }
-            Err(e) => tool_error(
-                    self.timing_enabled,
-                    &request_timer,
-                    format!("Failed to read file: {e}"),
-                ),
-        }
+        finalize_tool_json(
+            self.timing_enabled,
+            &request_timer,
+            &lookup.response,
+            stages,
+        )
     }
 
     #[tool(
@@ -834,6 +809,17 @@ impl KbServer {
             indexer::progress::ProgressReporter::new(indexer::progress::ProgressMode::Quiet),
         ) {
             Ok(result) => {
+                if let Ok(mut guard) = self.document_index.write() {
+                    if let Err(e) = guard.rebuild_from_kb(
+                        &self.kb_path,
+                        &self.exclude_dirs,
+                        &self.parser_registry,
+                        self.exclude_headings.as_deref(),
+                        GET_DOCUMENT_MAX_BYTES,
+                    ) {
+                        eprintln!("document index refresh after rebuild_index failed: {e}");
+                    }
+                }
                 let stats = IndexStats {
                     total_documents: result.total_documents,
                     updated: result.updated,
@@ -1265,9 +1251,8 @@ pub fn compute_match_spans(query: &str, content: &str) -> Option<Vec<crate::db::
 /// `get_document` ツール用に、拡張子に対応する Parser で
 /// frontmatter (title/date/topic/tags) を抽出し DocumentResponse を組む。
 /// 純粋関数化してテスト可能にしている。
-/// `get_document` の最大バイト数。1 MiB を超える文書は read_to_string
-/// 一括読みでのメモリ膨張・レスポンス過大を避けるため拒否する。
-pub(crate) const GET_DOCUMENT_MAX_BYTES: u64 = 1024 * 1024;
+/// `get_document` の最大バイト数。1 MiB を超える文書は index / serve 対象外。
+pub(crate) use crate::document_index::GET_DOCUMENT_MAX_BYTES;
 
 /// `search` MCP tool が受理する query 文字列の最大バイト数 (1 KiB)。
 /// 上限超えは ErrorResponse で reject する。embedder / FTS5 layer は内部で
@@ -1393,14 +1378,76 @@ fn build_document_response(
         Some(p) => p.parse(&raw, path_hint, &[]),
         None => markdown::parse(&raw),
     };
+    document_entry_to_response(
+        path_hint,
+        &DocumentEntry {
+            path: path_hint.to_string(),
+            title: parsed.frontmatter.title,
+            date: parsed.frontmatter.date,
+            topic: parsed.frontmatter.topic,
+            category: None,
+            tags: parsed.frontmatter.tags,
+            content: raw,
+            body: None,
+            content_hash: String::new(),
+            last_modified: None,
+        },
+    )
+}
+
+fn document_entry_to_response(client_path: &str, entry: &DocumentEntry) -> DocumentResponse {
     DocumentResponse {
-        path: path_hint.to_string(),
-        title: parsed.frontmatter.title,
-        date: parsed.frontmatter.date,
-        topic: parsed.frontmatter.topic,
-        tags: parsed.frontmatter.tags,
-        content: raw,
+        path: client_path.to_string(),
+        title: entry.title.clone(),
+        date: entry.date.clone(),
+        topic: entry.topic.clone(),
+        tags: entry.tags.clone(),
+        content: entry.content.clone(),
     }
+}
+
+#[derive(Debug)]
+struct GetDocumentLookup {
+    response: DocumentResponse,
+    cache_lookup_ms: u64,
+    response_build_ms: u64,
+}
+
+/// Core `get_document` retrieval: in-memory index only (no disk / search pipeline).
+pub(crate) fn get_document_from_index(
+    index: &SharedDocumentIndex,
+    client_path: &str,
+    registry: &Registry,
+) -> Result<GetDocumentLookup, String> {
+    validate_rel_path_key(client_path, registry)?;
+    let rel = normalize_rel_path(client_path).ok_or_else(|| {
+        format!(
+            "File not found: {client_path}. Path should be relative to knowledge-base/ (e.g. \"deep-dive/mcp/overview.md\")."
+        )
+    })?;
+
+    let cache_timer = StageTimer::start();
+    let cached = index
+        .read()
+        .ok()
+        .and_then(|guard| guard.get(&rel).cloned());
+    let cache_lookup_ms = cache_timer.elapsed_ms();
+
+    let entry = cached.ok_or_else(|| {
+        format!(
+            "File not found: {rel}. Path should be relative to knowledge-base/ (e.g. \"deep-dive/mcp/overview.md\")."
+        )
+    })?;
+
+    let build_timer = StageTimer::start();
+    let response = document_entry_to_response(client_path, &entry);
+    let response_build_ms = build_timer.elapsed_ms();
+
+    Ok(GetDocumentLookup {
+        response,
+        cache_lookup_ms,
+        response_build_ms,
+    })
 }
 
 /// `get_best_practice` のパス解決結果。
@@ -1534,6 +1581,8 @@ pub struct KbServerShared {
     pub allowed_admin_hosts: Vec<String>,
     /// When false, MCP tool responses omit `timing_ms`.
     pub timing_enabled: bool,
+    /// In-memory document cache shared across MCP sessions and the watcher.
+    pub document_index: SharedDocumentIndex,
 }
 
 #[derive(Debug)]
@@ -1574,6 +1623,7 @@ impl KbServer {
             search_config: shared.search_config.clone(),
             indexing_state: Arc::clone(&shared.indexing_state),
             timing_enabled: shared.timing_enabled,
+            document_index: Arc::clone(&shared.document_index),
             tool_router: KbServer::tool_router(),
         }
     }
@@ -1651,6 +1701,7 @@ impl KbServerShared {
     pub fn for_test(db: Database, embedder: Embedder, kb_path: PathBuf) -> Self {
         use std::sync::atomic::AtomicBool;
         use std::time::{Instant, SystemTime};
+        let document_index = document_index::new_shared_index();
         Self {
             db: Arc::new(Mutex::new(db)),
             embedder: Arc::new(Mutex::new(embedder)),
@@ -1672,6 +1723,7 @@ impl KbServerShared {
             config_source_label: "TestStub".into(),
             allowed_admin_hosts: vec!["127.0.0.1".into(), "::1".into(), "localhost".into()],
             timing_enabled: true,
+            document_index,
         }
     }
 }
@@ -1743,6 +1795,14 @@ pub async fn run_server(
 
     // watcher と共有するため Arc 化。
     // HTTP service factory でも共有するため KbServerShared にまとめる。
+    let document_index = document_index::build_shared_at_startup(
+        &kb_path,
+        &exclude_dirs,
+        &parser_registry,
+        exclude_headings.as_deref(),
+        GET_DOCUMENT_MAX_BYTES,
+    )?;
+
     let shared = KbServerShared {
         db: Arc::new(Mutex::new(db)),
         embedder: Arc::new(Mutex::new(embedder)),
@@ -1764,6 +1824,7 @@ pub async fn run_server(
         config_source_label: format!("{:?}", config_source),
         allowed_admin_hosts,
         timing_enabled,
+        document_index: Arc::clone(&document_index),
     };
 
     // watcher をバックグラウンドで並走。
@@ -1776,6 +1837,7 @@ pub async fn run_server(
         exclude_dirs: shared.exclude_dirs.clone(),
         config: watch_config,
         watcher_active: Arc::clone(&watcher_active),
+        document_index: Arc::clone(&document_index),
     };
     let watcher_handle = tokio::spawn(async move {
         if let Err(e) = crate::watcher::run_watch_loop(watcher_state).await {
@@ -2627,5 +2689,76 @@ mod tests {
                 + timing["tool_execution"].as_u64().unwrap()
                 + timing["serialization"].as_u64().unwrap()
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // get_document: in-memory document index (issue #2)
+    // -----------------------------------------------------------------------
+
+    const DOC_INDEX_SAMPLE: &str = r#"---
+title: Cached Doc
+date: 2026-02-01
+topic: cache
+tags: [x]
+---
+
+# Section
+
+Indexed body.
+"#;
+
+    #[test]
+    fn test_get_document_from_index_hit() {
+        let kb = TempKb::new("gd-cache");
+        kb.write("cached.md", DOC_INDEX_SAMPLE);
+        let index = document_index::new_shared_index();
+        {
+            let mut guard = index.write().unwrap();
+            guard
+                .rebuild_from_kb(
+                    &kb.path,
+                    &[],
+                    &Registry::default(),
+                    None,
+                    GET_DOCUMENT_MAX_BYTES,
+                )
+                .unwrap();
+        }
+        let lookup =
+            get_document_from_index(&index, "cached.md", &Registry::default()).unwrap();
+        assert_eq!(lookup.response.title.as_deref(), Some("Cached Doc"));
+        assert_eq!(lookup.response.topic.as_deref(), Some("cache"));
+        assert!(lookup.response.content.contains("Indexed body"));
+    }
+
+    #[test]
+    fn test_get_document_from_index_not_found() {
+        let index = document_index::new_shared_index();
+        let err = get_document_from_index(&index, "missing.md", &Registry::default())
+            .expect_err("missing path");
+        assert!(err.contains("File not found"));
+    }
+
+    #[test]
+    fn test_get_document_from_index_no_disk_or_search_stages() {
+        let kb = TempKb::new("gd-stages");
+        kb.write("a.md", DOC_INDEX_SAMPLE);
+        let index = document_index::new_shared_index();
+        {
+            let mut guard = index.write().unwrap();
+            guard
+                .rebuild_from_kb(
+                    &kb.path,
+                    &[],
+                    &Registry::default(),
+                    None,
+                    GET_DOCUMENT_MAX_BYTES,
+                )
+                .unwrap();
+        }
+        let lookup = get_document_from_index(&index, "a.md", &Registry::default()).unwrap();
+        // Stage timers are populated; disk_read / frontmatter_parse stay 0 in handler.
+        assert!(lookup.cache_lookup_ms < 100);
+        assert!(lookup.response_build_ms < 100);
     }
 }

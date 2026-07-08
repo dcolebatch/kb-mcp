@@ -512,7 +512,7 @@ pub fn rename_single_file(
 /// `registry`. Directories whose basename matches any entry in
 /// `exclude_dirs` are skipped (along with their subtree). Sort for
 /// deterministic ordering.
-fn collect_source_files(
+pub(crate) fn collect_source_files(
     kb_path: &Path,
     registry: &Registry,
     exclude_dirs: &[String],
@@ -558,7 +558,7 @@ fn collect_source_files(
 /// "ai-news/2026-04-16.md"         → (Some("ai-news"), None)
 /// "index.md"                       → (None, None)
 /// ```
-fn extract_category_topic(rel_path: &str) -> (Option<String>, Option<String>) {
+pub(crate) fn extract_category_topic(rel_path: &str) -> (Option<String>, Option<String>) {
     let parts: Vec<&str> = rel_path.split('/').collect();
     match parts.len() {
         // "index.md" — no category, no topic
@@ -571,7 +571,7 @@ fn extract_category_topic(rel_path: &str) -> (Option<String>, Option<String>) {
 }
 
 /// Compute the hex-encoded SHA-256 digest of a string.
-fn sha256_hex(content: &str) -> String {
+pub(crate) fn sha256_hex(content: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(content.as_bytes());
     format!("{:x}", hasher.finalize())
