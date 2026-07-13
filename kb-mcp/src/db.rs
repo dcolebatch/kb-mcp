@@ -189,6 +189,15 @@ impl CompiledPathGlobs {
     }
 }
 
+/// One document listed under a topic group (path usable by `get_document`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TopicDocument {
+    /// May be omitted in SQLite `json_object` when the DB title is NULL.
+    #[serde(default)]
+    pub title: Option<String>,
+    pub path: String,
+}
+
 /// Topic/category grouping returned by [`Database::list_topics`].
 #[derive(Debug, Clone)]
 pub struct TopicInfo {
@@ -197,6 +206,9 @@ pub struct TopicInfo {
     pub file_count: u32,
     pub last_updated: Option<String>,
     pub titles: Vec<String>,
+    /// Documents in this group; each `path` is the vault-relative key for
+    /// `get_document` (same string stored in `documents.path`).
+    pub documents: Vec<TopicDocument>,
 }
 
 /// FTS5 クエリ用にユーザ入力をサニタイズする。
@@ -1373,11 +1385,14 @@ impl Database {
         // タイトルは json_group_array で集めて JSON 配列として受ける。
         // 旧実装は GROUP_CONCAT(title, '||') + split を使っていたが、
         // タイトル中に "||" を含む doc が紛れると誤分割していた。
+        // documents は title+path のオブジェクト配列 — path は get_document
+        // にそのまま渡せる vault-relative key。
         let sql = "
             SELECT category, topic,
                    COUNT(*) AS file_count,
                    MAX(last_indexed) AS last_updated,
-                   json_group_array(title) AS titles_json
+                   json_group_array(title) AS titles_json,
+                   json_group_array(json_object('title', title, 'path', path)) AS documents_json
             FROM documents
             GROUP BY category, topic
             ORDER BY category, topic
@@ -1390,12 +1405,18 @@ impl Database {
                 .and_then(|s| serde_json::from_str::<Vec<Option<String>>>(s).ok())
                 .map(|v| v.into_iter().flatten().collect())
                 .unwrap_or_default();
+            let documents_json: Option<String> = row.get(5)?;
+            let documents: Vec<TopicDocument> = documents_json
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_default();
             Ok(TopicInfo {
                 category: row.get(0)?,
                 topic: row.get(1)?,
                 file_count: row.get(2)?,
                 last_updated: row.get(3)?,
                 titles,
+                documents,
             })
         })?;
         rows.into_iter()
@@ -3292,6 +3313,11 @@ mod tests {
             .expect("should have ai-news group");
         assert_eq!(ai.file_count, 1);
         assert!(ai.titles.contains(&"AI News Today".to_string()));
+        assert_eq!(ai.documents.len() as u32, ai.file_count);
+        assert!(ai.documents.iter().any(|d| {
+            d.title.as_deref() == Some("AI News Today")
+                && d.path == "ai-news/2026-04-16.md"
+        }));
 
         // Find the deep-dive/mcp group
         let mcp = topics
@@ -3301,8 +3327,75 @@ mod tests {
         assert_eq!(mcp.file_count, 2);
         assert!(mcp.titles.contains(&"MCP Overview".to_string()));
         assert!(mcp.titles.contains(&"MCP Features".to_string()));
+        assert_eq!(mcp.documents.len() as u32, mcp.file_count);
+        assert!(mcp.documents.iter().any(|d| {
+            d.title.as_deref() == Some("MCP Overview")
+                && d.path == "deep-dive/mcp/overview.md"
+        }));
+        assert!(mcp.documents.iter().any(|d| {
+            d.title.as_deref() == Some("MCP Features")
+                && d.path == "deep-dive/mcp/features.md"
+        }));
 
         println!("test_list_topics: OK");
+    }
+
+    /// Issue #5: `documents[].path` must be the same vault-relative key
+    /// that `get_document(path)` / `get_document_hash` accept — no rewriting.
+    #[test]
+    fn test_list_topics_documents_include_paths_usable_by_get_document() {
+        let db = Database::open_in_memory().unwrap();
+        db.upsert_document(
+            "deep-dive/mcp/overview.md",
+            Some("MCP Overview"),
+            Some("mcp"),
+            Some("deep-dive"),
+            Some("1"),
+            &[],
+            Some("2026-04-15"),
+            "h1",
+        )
+        .unwrap();
+        db.upsert_document(
+            "deep-dive/mcp/features.md",
+            Some("MCP Features"),
+            Some("mcp"),
+            Some("deep-dive"),
+            Some("3"),
+            &[],
+            Some("2026-04-16"),
+            "h2",
+        )
+        .unwrap();
+
+        let topics = db.list_topics().unwrap();
+        let mcp = topics
+            .iter()
+            .find(|t| t.topic.as_deref() == Some("mcp"))
+            .expect("mcp group");
+
+        // Backwards-compatible fields still present.
+        assert_eq!(mcp.category.as_deref(), Some("deep-dive"));
+        assert_eq!(mcp.file_count, 2);
+        assert!(mcp.last_updated.is_some());
+        assert_eq!(mcp.titles.len(), 2);
+        assert_eq!(mcp.documents.len() as u32, mcp.file_count);
+
+        for doc in &mcp.documents {
+            assert!(
+                !doc.path.is_empty(),
+                "document path must be non-empty: {doc:?}"
+            );
+            assert!(
+                db.get_document_hash(&doc.path).unwrap().is_some(),
+                "path {:?} from list_topics must work as get_document key",
+                doc.path
+            );
+        }
+
+        let paths: Vec<&str> = mcp.documents.iter().map(|d| d.path.as_str()).collect();
+        assert!(paths.contains(&"deep-dive/mcp/overview.md"));
+        assert!(paths.contains(&"deep-dive/mcp/features.md"));
     }
 
     /// Regression for F-30: title that contains the legacy `||` separator
