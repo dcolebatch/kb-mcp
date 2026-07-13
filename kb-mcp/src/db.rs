@@ -192,8 +192,7 @@ impl CompiledPathGlobs {
 /// One document listed under a topic group (path usable by `get_document`).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TopicDocument {
-    /// May be omitted in SQLite `json_object` when the DB title is NULL.
-    #[serde(default)]
+    /// `null` in JSON when the DB title is NULL (`json_object` still emits the key).
     pub title: Option<String>,
     pub path: String,
 }

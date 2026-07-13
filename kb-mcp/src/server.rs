@@ -8,7 +8,7 @@ use rmcp::schemars;
 use rmcp::{tool, tool_router};
 use serde::{Deserialize, Serialize};
 
-use crate::db::{Database, SearchHit};
+use crate::db::{Database, SearchHit, TopicDocument};
 use crate::document_index::{
     self, normalize_rel_path, validate_rel_path_key, DocumentEntry, SharedDocumentIndex,
 };
@@ -216,19 +216,13 @@ struct GetConnectionGraphParams {
 // 個別に定義しない (CLI の `search` サブコマンドと schema 一致)。
 
 #[derive(Serialize)]
-struct TopicDocumentEntry {
-    title: Option<String>,
-    path: String,
-}
-
-#[derive(Serialize)]
 struct TopicEntry {
     category: Option<String>,
     topic: Option<String>,
     file_count: u32,
     last_updated: Option<String>,
     titles: Vec<String>,
-    documents: Vec<TopicDocumentEntry>,
+    documents: Vec<TopicDocument>,
 }
 
 #[derive(Serialize, Debug)]
@@ -594,7 +588,7 @@ impl KbServer {
 
     #[tool(
         name = "list_topics",
-        description = "List all indexed topics and categories with document counts. Each topic includes a documents array of {title, path}; use path with get_document for direct retrieval."
+        description = "List all indexed topics and categories with document counts. Each topic includes a documents array of {title, path} where title may be null; use path with get_document for direct retrieval."
     )]
     async fn list_topics(&self) -> String {
         let mut request_timer = ToolRequestTimer::start();
@@ -615,14 +609,7 @@ impl KbServer {
                         file_count: t.file_count,
                         last_updated: t.last_updated,
                         titles: t.titles,
-                        documents: t
-                            .documents
-                            .into_iter()
-                            .map(|d| TopicDocumentEntry {
-                                title: d.title,
-                                path: d.path,
-                            })
-                            .collect(),
+                        documents: t.documents,
                     })
                     .collect();
                 let resp = ListTopicsResponse { topics: entries };
