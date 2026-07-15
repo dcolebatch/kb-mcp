@@ -681,7 +681,7 @@ FASTEMBED_CACHE_DIR=~/.cache/huggingface/hub \
 | ツール | 説明 | 主なパラメータ |
 |---|---|---|
 | `search` | ベクトル + FTS5 全文検索を Reciprocal Rank Fusion でマージしたハイブリッド検索、任意で cross-encoder 再ランク + MMR 多様性再ランク + parent retriever 展開。`{ results, low_confidence, filter_applied }` ラッパで関連度ランク付き chunk を返す。parent retriever が発火した行には `expanded_from` も付く。詳細: [docs/citations.ja.md](docs/citations.ja.md)、[docs/filters.ja.md](docs/filters.ja.md)、[docs/retrieval-pipeline.ja.md](docs/retrieval-pipeline.ja.md) | `query` (必須)、`limit`、`category`、`topic`、`rerank` (サーバ既定を上書き)、`min_quality`、`include_low_quality`、`path_globs` (`!` 始まりは exclude)、`tags_any` / `tags_all`、`date_from` / `date_to` (`YYYY-MM-DD`)、`min_confidence_ratio`、`mmr` / `mmr_lambda` / `mmr_same_doc_penalty` (v0.7.0+)、`parent_retriever` (v0.7.0+) |
-| `list_topics` | index 済みの全トピック / カテゴリと文書数を列挙 | (なし) |
+| `list_topics` | index 済みの全トピック / カテゴリと文書数を列挙。`{ topics, timing_ms }` を返す。各トピックは従来の `category` / `topic` / `file_count` / `last_updated` / `titles` に加え、`documents: [{ title, path }]` を含む（`title` は欠ける場合 `null`）。`path` はそのまま `get_document` に渡せる（推奨フロー: `list_topics()` → `get_document(path)`） | (なし) |
 | `get_document` | 相対パスから文書の全文 + メタデータを取得 | `path` (例: `"deep-dive/mcp/overview.md"`) |
 | `get_best_practice` | opt-in: `kb-mcp.toml` の `[best_practice].path_templates` を設定しているときのみ機能する。対象向けの best practice 文書を取得し、任意で特定 h2 セクションを抽出。未設定時は "not configured" エラーを返す | `target` (例: `"claude-code"`)、`category` (任意) |
 | `rebuild_index` | すべてのソースファイル (Markdown + `[parsers].enabled` で有効化された拡張子) を走査してインデックス再構築 | `force` (任意、既定 false) |

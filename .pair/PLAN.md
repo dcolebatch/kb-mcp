@@ -1,52 +1,44 @@
 ## Diagnosis
 
-- Root cause: `get_document` in `kb-mcp/src/server.rs` performed per-request disk I/O (`validate_get_document_path` → `read_to_string` → parse) with no in-memory document cache, so known-path retrieval paid full filesystem + parse cost (~700 ms observed) even though agents only need a path lookup after search.
-- Confirmed by: `kb-mcp/src/server.rs` (pre-change `get_document` handler used `std::fs::read_to_string`); `docs/perf-instrumentation.md` noted `cache_lookup: 0` until a cache exists; issue #2 acceptance criteria.
-- Observability traps: `timing_ms` from #1 could show low `tool_execution` while disk syscalls dominated; a warm OS page cache could mask the problem locally.
+- Root cause: `Database::list_topics()` aggregates only `title` via `json_group_array(title)` and never returns `documents.path`, the vault-relative key that `get_document(path)` requires. Agents see titles but cannot deterministically call `get_document` without guessing paths or falling back to `search()`.
+- Confirmed by: `kb-mcp/src/db.rs` `TopicInfo` (fields: category/topic/file_count/last_updated/titles only); `list_topics` SQL omits `path`; `kb-mcp/src/server.rs` `TopicEntry` mirrors that shape; issue #5 reproduction steps.
+- Observability traps: `file_count` and `titles` look complete and healthy while the navigation workflow is still broken for agents.
 
 ## Proposed Fix
 
-- Add `document_index` module: build an in-memory `HashMap` of canonical relative paths → parsed metadata + raw content at `run_server` startup; share via `Arc<RwLock<_>>` on `KbServerShared`.
-- Rewrite `get_document` to validate the path key without disk I/O, lookup the index, and build the existing `DocumentResponse` shape; record `cache_lookup` / `response_build` timings.
-- Refresh the index on `rebuild_index` completion and watcher create/modify/delete/rename events.
-- Why not DB-backed lookup: SQLite still adds query latency and couples retrieval to search-index state; issue requires avoiding the search pipeline entirely and keeping hot path in memory.
+- Extend `TopicInfo` / MCP `TopicEntry` with `documents: [{ title, path }]` sourced from the same `documents` rows, keep existing fields for backwards compatibility, assert `file_count == documents.len()`.
+- Why this and not (1) embedding paths into `titles` strings — would break BC and force parsing; (2) a separate `list_documents` tool — adds a hop agents must discover and does not fix `list_topics` itself.
 
 ## Files & Line Numbers
 
-- `kb-mcp/src/document_index.rs` — new module: index build, upsert/remove/rename, path normalization
-- `kb-mcp/src/server.rs` — wire shared index, lean `get_document`, refresh after `rebuild_index`
-- `kb-mcp/src/watcher.rs` — keep document index in sync with incremental indexer events
-- `kb-mcp/src/indexer.rs` — `pub(crate)` helpers reused by document index walk
-- `kb-mcp/src/timing.rs` — add `response_build` to `GetDocumentStageTimingMs`
-- `kb-mcp/tests/document_index_integration.rs` — MCP + latency + watcher refresh tests (`#[ignore]`)
-- `docs/perf-instrumentation.md`, `README.md` — document direct-retrieval semantics
+- `kb-mcp/src/db.rs` — add `TopicDocument`, extend `TopicInfo`, extend `list_topics()` SQL/`json_object` parse
+- `kb-mcp/src/server.rs` — `TopicEntry` + tool description + mapping
+- `kb-mcp/src/db.rs` tests — shape, BC fields, path → `get_document_hash` usability
+- `README.md` / `README.ja.md` — MCP tool table + recommended workflow
 
 ## Side-Effects Trace
 
-- `get_document_from_index` / `get_document`: only readers of `document_index`; no `db` / `embedder` locks — search/rerank/vector paths untouched.
-- `DocumentIndex::rebuild_from_kb`: called at startup and after `rebuild_index`; full scan duplicates disk reads already done by indexer during rebuild (acceptable, off hot path).
-- Watcher `dispatch_*`: after DB indexer calls, upsert/remove/rename document index; failure logs to stderr, does not roll back SQLite index.
-- `KbServerShared` / `WatcherState` gain `document_index` field — all `from_shared` / HTTP session clones share the same Arc (intended).
-- Existing `validate_get_document_path` retained for `get_best_practice`; unit tests unchanged.
-- New tests: `document_index` unit tests, `get_document_from_index` server tests (no embedder), integration tests ignored by default.
+- `Database::list_topics()` callers: MCP `server::list_topics` only (plus unit tests). CLI has no separate topics dump of this struct. Adding a field is additive JSON; existing consumers that ignore unknown fields stay valid.
+- `TopicInfo` / `TopicEntry`: new field only; `titles` aggregation logic unchanged (still flattens null titles), so `titles.len()` may remain `< file_count` when some titles are NULL — pre-existing.
+- Shared state: read-only SELECT on `documents`; no schema migration, no index rebuild, no cache invalidation.
+- New path: `documents` array paths must equal stored `documents.path` (same key as document index / `get_document`); covered by new test via `get_document_hash(path)`.
+- Uncovered initially: MCP HTTP integration for `list_topics` JSON — unit-level DB + server mapping is sufficient for AC; no HTTP golden for topics today.
 
 ## Acceptance Criteria
 
-- [x] In-memory index built at server startup for all readable KB docs
-- [x] `get_document` reads index only; no search / embedding / vector / rerank
-- [x] Index refreshed on full re-index and watcher events (create/modify/delete/rename)
-- [x] Clear not-found when path missing from index
-- [x] Existing response shape preserved; `cache_lookup`, `response_build`, `total` timings
-- [x] Tests for index build, refresh, removal, not-found, no disk stages on hot path
-- [x] Docs + latency integration test (`document_index_integration`)
+- [x] `list_topics()` retains `category`, `topic`, `file_count`, `last_updated`, `titles`
+- [x] Each topic entry includes `documents: [{ title, path }]`
+- [x] Every `path` is usable as `get_document(path)` without transformation
+- [x] `file_count == documents.len()`
+- [x] Automated tests cover BC fields + `documents`
+- [x] README.md / README.ja.md document the field and `list_topics` → `get_document(path)` workflow
 
 ## Test Plan
 
-- Failing test first: `test_get_document_from_index_not_found` (path absent from index)
-- Unit: `document_index` rebuild/upsert/remove/rename; `get_document_from_index` hit/miss
-- Integration (`--ignored`): MCP `get_document` timing fields; median latency; watcher refresh
-- Regression: `cargo test`, `cargo check`; existing server path-validation tests
+- Failing test first: `test_list_topics_documents_include_paths_usable_by_get_document` in `kb-mcp/src/db.rs` — asserts `documents` shape, `file_count` consistency, and `get_document_hash(path).is_some()` for each path
+- Extend `test_list_topics` for `documents` presence alongside existing title assertions
+- Regression: `test_list_topics_title_with_double_pipe_is_not_split`, full `cargo test`
 
 ## What I Am Most Likely Wrong About
 
-- Startup memory footprint for very large vaults (full raw content held in RAM) may be unacceptable on constrained hosts; we assume typical agent KB sizes fit in memory and that skipping oversized files at index time is sufficient.
+- Whether `title` inside `documents` should be `Option<String>` (honest DB nulls) vs always a string (empty when missing). AC says each element has `title` and `path`; null JSON for title preserves document rows with `file_count` parity better than dropping them the way `titles` does.
