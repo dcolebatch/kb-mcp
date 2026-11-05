@@ -72,13 +72,127 @@ impl ModelChoice {
     }
 }
 
-/// Thin wrapper around fastembed for generating text embeddings.
+/// Resolved embedding backend + the index identity (`model_id`, dimension).
 ///
-/// モデルは [`ModelChoice`] で切替可能。ONNX モデルは初回実行時に
-/// [`resolve_cache_dir`] のキャッシュディレクトリへダウンロードされる。
+/// Built from config / CLI before contacting any remote endpoint so
+/// `verify_embedding_meta` stays deterministic.
+#[derive(Clone, Debug)]
+pub struct EmbeddingSettings {
+    provider: ProviderSettings,
+    model_id: String,
+    dimension: usize,
+}
+
+#[derive(Clone, Debug)]
+enum ProviderSettings {
+    FastEmbed(ModelChoice),
+    OpenAiCompatible(OpenAiCompatibleConfig),
+}
+
+/// Config for an OpenAI-compatible `POST /v1/embeddings` endpoint (Ollama, TEI, …).
+#[derive(Clone, Debug)]
+pub struct OpenAiCompatibleConfig {
+    pub endpoint: String,
+    pub model: String,
+    pub dimension: usize,
+    pub timeout_seconds: u64,
+    pub batch_size: usize,
+    pub api_key: Option<String>,
+}
+
+impl OpenAiCompatibleConfig {
+    /// Index-meta identity: `openai:{alias}`.
+    pub fn model_id(model: &str) -> String {
+        format!("openai:{model}")
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.endpoint.trim().is_empty() {
+            anyhow::bail!("[embedding].endpoint must be a non-empty URL");
+        }
+        if self.model.trim().is_empty() {
+            anyhow::bail!("[embedding].model must be a non-empty alias");
+        }
+        if self.dimension == 0 {
+            anyhow::bail!("[embedding].dimension must be > 0");
+        }
+        if self.timeout_seconds == 0 {
+            anyhow::bail!("[embedding].timeout_seconds must be > 0");
+        }
+        if self.batch_size == 0 {
+            anyhow::bail!("[embedding].batch_size must be > 0");
+        }
+        let url = reqwest::Url::parse(self.endpoint.trim())
+            .map_err(|e| anyhow::anyhow!("[embedding].endpoint is not a valid URL: {e}"))?;
+        if url.scheme() != "http" && url.scheme() != "https" {
+            anyhow::bail!(
+                "[embedding].endpoint must use http or https, got {}",
+                url.scheme()
+            );
+        }
+        if !url.username().is_empty() || url.password().is_some() {
+            anyhow::bail!(
+                "[embedding].endpoint must not embed credentials; use [embedding].api_key instead"
+            );
+        }
+        Ok(())
+    }
+}
+
+impl EmbeddingSettings {
+    pub fn fastembed(choice: ModelChoice) -> Self {
+        Self {
+            provider: ProviderSettings::FastEmbed(choice),
+            model_id: choice.model_id().to_string(),
+            dimension: choice.dimension(),
+        }
+    }
+
+    pub fn openai_compatible(config: OpenAiCompatibleConfig) -> Result<Self> {
+        config.validate()?;
+        let model_id = OpenAiCompatibleConfig::model_id(config.model.trim());
+        let dimension = config.dimension;
+        Ok(Self {
+            provider: ProviderSettings::OpenAiCompatible(config),
+            model_id,
+            dimension,
+        })
+    }
+
+    pub fn model_id(&self) -> &str {
+        &self.model_id
+    }
+
+    pub fn dimension(&self) -> usize {
+        self.dimension
+    }
+
+    pub fn is_openai_compatible(&self) -> bool {
+        matches!(self.provider, ProviderSettings::OpenAiCompatible(_))
+    }
+}
+
+enum Backend {
+    FastEmbed {
+        model: TextEmbedding,
+        choice: ModelChoice,
+    },
+    OpenAi(OpenAiHttpBackend),
+}
+
+struct OpenAiHttpBackend {
+    client: reqwest::blocking::Client,
+    endpoint: String,
+    model: String,
+    dimension: usize,
+    batch_size: usize,
+}
+
+/// Thin wrapper around FastEmbed or an OpenAI-compatible HTTP embedder.
 pub struct Embedder {
-    model: TextEmbedding,
-    choice: ModelChoice,
+    backend: Backend,
+    model_id: String,
+    dimension: usize,
 }
 
 impl Embedder {
@@ -94,27 +208,78 @@ impl Embedder {
         Self::with_model(ModelChoice::default())
     }
 
-    /// 明示的にモデルを指定して初期化する。
+    /// 明示的に FastEmbed モデルを指定して初期化する。
     pub fn with_model(choice: ModelChoice) -> Result<Self> {
-        eprintln!(
-            "Loading embedding model: {} ({} dim, ~{} MB on first run)...",
-            choice.model_id(),
-            choice.dimension(),
-            choice.approx_download_mb()
-        );
-        let model = TextEmbedding::try_new(
-            InitOptions::new(choice.fastembed_model())
-                .with_cache_dir(resolve_cache_dir())
-                .with_show_download_progress(true),
-        )?;
-        Ok(Self { model, choice })
+        Self::with_settings(EmbeddingSettings::fastembed(choice))
     }
 
-    /// Embed multiple texts in a batch. バッチサイズは `ModelChoice::batch_size()`
-    /// から決定 (大きなモデルで OOM を起こさないよう明示的に絞る)。
+    /// Initialize from resolved config / CLI settings.
+    pub fn with_settings(settings: EmbeddingSettings) -> Result<Self> {
+        let EmbeddingSettings {
+            provider,
+            model_id,
+            dimension,
+        } = settings;
+        let backend = match provider {
+            ProviderSettings::FastEmbed(choice) => {
+                eprintln!(
+                    "Loading embedding model: {} ({} dim, ~{} MB on first run)...",
+                    choice.model_id(),
+                    choice.dimension(),
+                    choice.approx_download_mb()
+                );
+                let model = TextEmbedding::try_new(
+                    InitOptions::new(choice.fastembed_model())
+                        .with_cache_dir(resolve_cache_dir())
+                        .with_show_download_progress(true),
+                )?;
+                Backend::FastEmbed { model, choice }
+            }
+            ProviderSettings::OpenAiCompatible(config) => {
+                eprintln!(
+                    "Using OpenAI-compatible embeddings: {} ({} dim) via {}",
+                    config.model.trim(),
+                    config.dimension,
+                    config.endpoint.trim()
+                );
+                let mut builder = reqwest::blocking::Client::builder()
+                    .timeout(std::time::Duration::from_secs(config.timeout_seconds))
+                    .redirect(reqwest::redirect::Policy::none());
+                if let Some(key) = config.api_key.as_ref().filter(|k| !k.is_empty()) {
+                    let mut headers = reqwest::header::HeaderMap::new();
+                    let value = reqwest::header::HeaderValue::from_str(&format!("Bearer {key}"))
+                        .map_err(|e| anyhow::anyhow!("invalid [embedding].api_key for Authorization header: {e}"))?;
+                    headers.insert(reqwest::header::AUTHORIZATION, value);
+                    builder = builder.default_headers(headers);
+                }
+                let client = builder
+                    .build()
+                    .map_err(|e| anyhow::anyhow!("failed to build HTTP embedding client: {e}"))?;
+                Backend::OpenAi(OpenAiHttpBackend {
+                    client,
+                    endpoint: config.endpoint.trim().to_string(),
+                    model: config.model.trim().to_string(),
+                    dimension: config.dimension,
+                    batch_size: config.batch_size,
+                })
+            }
+        };
+        Ok(Self {
+            backend,
+            model_id,
+            dimension,
+        })
+    }
+
+    /// Embed multiple texts in a batch.
     pub fn embed_texts(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-        let embeddings = self.model.embed(texts, Some(self.choice.batch_size()))?;
-        Ok(embeddings)
+        match &mut self.backend {
+            Backend::FastEmbed { model, choice } => {
+                let embeddings = model.embed(texts, Some(choice.batch_size()))?;
+                Ok(embeddings)
+            }
+            Backend::OpenAi(http) => http.embed_texts(texts),
+        }
     }
 
     /// Embed a single text.
@@ -127,12 +292,109 @@ impl Embedder {
 
     /// 選択中のモデルの埋め込み次元数。
     pub fn dimension(&self) -> usize {
-        self.choice.dimension()
+        self.dimension
     }
 
     /// 選択中のモデルの識別子 (index_meta に記録される)。
-    pub fn model_id(&self) -> &'static str {
-        self.choice.model_id()
+    pub fn model_id(&self) -> &str {
+        &self.model_id
+    }
+
+    /// True when this embedder uses a blocking HTTP client (must not run on a
+    /// tokio worker without `spawn_blocking`).
+    pub fn uses_blocking_http(&self) -> bool {
+        matches!(self.backend, Backend::OpenAi(_))
+    }
+}
+
+impl OpenAiHttpBackend {
+    fn embed_texts(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::with_capacity(texts.len());
+        for chunk in texts.chunks(self.batch_size) {
+            let batch = self.embed_batch(chunk)?;
+            out.extend(batch);
+        }
+        Ok(out)
+    }
+
+    fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        #[derive(serde::Serialize)]
+        struct Request<'a> {
+            model: &'a str,
+            input: &'a [&'a str],
+        }
+        #[derive(serde::Deserialize)]
+        struct Response {
+            data: Vec<Item>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Item {
+            index: Option<usize>,
+            embedding: Vec<f32>,
+        }
+
+        let body = Request {
+            model: &self.model,
+            input: texts,
+        };
+        let response = self
+            .client
+            .post(&self.endpoint)
+            .json(&body)
+            .send()
+            .map_err(|e| anyhow::anyhow!("embedding HTTP request failed: {e}"))?;
+        let status = response.status();
+        if !status.is_success() {
+            let snippet = response
+                .text()
+                .unwrap_or_default()
+                .chars()
+                .take(512)
+                .collect::<String>();
+            anyhow::bail!(
+                "embedding endpoint returned HTTP {status}: {}",
+                snippet.replace('\n', " ")
+            );
+        }
+        let parsed: Response = response
+            .json()
+            .map_err(|e| anyhow::anyhow!("embedding response JSON parse failed: {e}"))?;
+        if parsed.data.len() != texts.len() {
+            anyhow::bail!(
+                "embedding response length mismatch: got {} vectors for {} inputs",
+                parsed.data.len(),
+                texts.len()
+            );
+        }
+
+        let mut ordered: Vec<Option<Vec<f32>>> = vec![None; texts.len()];
+        for (fallback_i, item) in parsed.data.into_iter().enumerate() {
+            let idx = item.index.unwrap_or(fallback_i);
+            if idx >= texts.len() {
+                anyhow::bail!("embedding response index {idx} out of range for {} inputs", texts.len());
+            }
+            if ordered[idx].is_some() {
+                anyhow::bail!("embedding response has duplicate index {idx}");
+            }
+            if item.embedding.len() != self.dimension {
+                anyhow::bail!(
+                    "embedding dimension mismatch at index {idx}: expected {}, got {}",
+                    self.dimension,
+                    item.embedding.len()
+                );
+            }
+            ordered[idx] = Some(item.embedding);
+        }
+        ordered
+            .into_iter()
+            .enumerate()
+            .map(|(i, v)| {
+                v.ok_or_else(|| anyhow::anyhow!("embedding response missing index {i}"))
+            })
+            .collect()
     }
 }
 
@@ -314,6 +576,97 @@ mod tests {
         assert_eq!(ModelChoice::BgeM3.model_id(), "bge-m3");
         assert_eq!(ModelChoice::BgeM3.dimension(), 1024);
         assert_eq!(ModelChoice::default(), ModelChoice::BgeSmallEnV15);
+    }
+
+    #[test]
+    fn test_openai_compatible_model_id() {
+        assert_eq!(
+            OpenAiCompatibleConfig::model_id("nomic-embed-text"),
+            "openai:nomic-embed-text"
+        );
+        let settings = EmbeddingSettings::openai_compatible(OpenAiCompatibleConfig {
+            endpoint: "http://127.0.0.1:11434/v1/embeddings".into(),
+            model: "nomic-embed-text".into(),
+            dimension: 768,
+            timeout_seconds: 120,
+            batch_size: 32,
+            api_key: None,
+        })
+        .unwrap();
+        assert_eq!(settings.model_id(), "openai:nomic-embed-text");
+        assert_eq!(settings.dimension(), 768);
+        assert!(settings.is_openai_compatible());
+    }
+
+    #[test]
+    fn test_openai_compatible_rejects_bad_endpoint() {
+        let err = EmbeddingSettings::openai_compatible(OpenAiCompatibleConfig {
+            endpoint: "not a url".into(),
+            model: "nomic-embed-text".into(),
+            dimension: 768,
+            timeout_seconds: 60,
+            batch_size: 32,
+            api_key: None,
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("endpoint"));
+    }
+
+    #[test]
+    fn test_openai_http_embed_happy_path_and_dim_mismatch() {
+        let server = httpmock::MockServer::start();
+        let ok = server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/v1/embeddings");
+            then.status(200).json_body(serde_json::json!({
+                "data": [
+                    {"index": 0, "embedding": [0.1, 0.2, 0.3]},
+                    {"index": 1, "embedding": [0.4, 0.5, 0.6]}
+                ]
+            }));
+        });
+
+        let mut embedder = Embedder::with_settings(
+            EmbeddingSettings::openai_compatible(OpenAiCompatibleConfig {
+                endpoint: server.url("/v1/embeddings"),
+                model: "mock-model".into(),
+                dimension: 3,
+                timeout_seconds: 5,
+                batch_size: 32,
+                api_key: None,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let vectors = embedder.embed_texts(&["a", "b"]).unwrap();
+        assert_eq!(vectors.len(), 2);
+        assert_eq!(vectors[0], vec![0.1, 0.2, 0.3]);
+        assert_eq!(vectors[1], vec![0.4, 0.5, 0.6]);
+        ok.assert();
+
+        let bad = httpmock::MockServer::start();
+        bad.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/v1/embeddings");
+            then.status(200).json_body(serde_json::json!({
+                "data": [{"index": 0, "embedding": [1.0, 2.0]}]
+            }));
+        });
+        let mut bad_embedder = Embedder::with_settings(
+            EmbeddingSettings::openai_compatible(OpenAiCompatibleConfig {
+                endpoint: bad.url("/v1/embeddings"),
+                model: "mock-model".into(),
+                dimension: 3,
+                timeout_seconds: 5,
+                batch_size: 32,
+                api_key: None,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let err = bad_embedder.embed_single("x").unwrap_err();
+        assert!(
+            err.to_string().contains("dimension mismatch"),
+            "got: {err}"
+        );
     }
 
     #[test]

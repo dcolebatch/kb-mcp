@@ -12,7 +12,7 @@ use crate::db::{Database, SearchHit, TopicDocument};
 use crate::document_index::{
     self, normalize_rel_path, validate_rel_path_key, DocumentEntry, SharedDocumentIndex,
 };
-use crate::embedder::{Embedder, ModelChoice, Reranker, RerankerChoice};
+use crate::embedder::{Embedder, EmbeddingSettings, Reranker, RerankerChoice};
 use crate::graph::{self, GraphOptions, SeedStrategy};
 use crate::parser::Registry;
 use crate::timing::{
@@ -425,19 +425,32 @@ impl KbServer {
         request_timer.mark_parse_done();
 
         let embed_timer = StageTimer::start();
-        let query_embedding = {
-            let mut embedder = self.embedder.lock().unwrap();
-            match embedder.embed_single(&params.query) {
-                Ok(emb) => emb,
-                Err(e) => {
-                    stages.embedding_generation = embed_timer.elapsed_ms();
-                    return search_error(
-                        self.timing_enabled,
-                        &request_timer,
-                        stages,
-                        format!("Failed to embed query: {e}"),
-                    );
-                }
+        // Blocking HTTP (OpenAI-compatible) and FastEmbed both burn CPU/IO; run
+        // off the tokio worker so reqwest::blocking cannot panic mid-runtime.
+        let embedder = Arc::clone(&self.embedder);
+        let query_text = params.query.clone();
+        let embed_result =
+            tokio::task::spawn_blocking(move || embedder.lock().unwrap().embed_single(&query_text))
+                .await;
+        let query_embedding = match embed_result {
+            Ok(Ok(emb)) => emb,
+            Ok(Err(e)) => {
+                stages.embedding_generation = embed_timer.elapsed_ms();
+                return search_error(
+                    self.timing_enabled,
+                    &request_timer,
+                    stages,
+                    format!("Failed to embed query: {e}"),
+                );
+            }
+            Err(e) => {
+                stages.embedding_generation = embed_timer.elapsed_ms();
+                return search_error(
+                    self.timing_enabled,
+                    &request_timer,
+                    stages,
+                    format!("Failed to embed query (join): {e}"),
+                );
             }
         };
         stages.embedding_generation = embed_timer.elapsed_ms();
@@ -1734,7 +1747,7 @@ impl KbServerShared {
 #[allow(clippy::too_many_arguments)]
 pub async fn run_server(
     kb_path: &std::path::Path,
-    model: ModelChoice,
+    embedding: EmbeddingSettings,
     reranker_choice: RerankerChoice,
     rerank_by_default: bool,
     exclude_headings: Option<Vec<String>>,
@@ -1756,8 +1769,8 @@ pub async fn run_server(
     let db = Database::open(&db_path.to_string_lossy())?;
 
     // モデル DL の前に meta 整合性を確認。不整合ならここで止めて DL を回避。
-    db.verify_embedding_meta(model.model_id(), model.dimension() as u32)?;
-    let embedder = Embedder::with_model(model)?;
+    db.verify_embedding_meta(embedding.model_id(), embedding.dimension() as u32)?;
+    let embedder = Embedder::with_settings(embedding)?;
     let reranker = Reranker::try_new(reranker_choice)?;
 
     let kb_path = kb_path

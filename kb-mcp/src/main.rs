@@ -489,7 +489,7 @@ fn main() -> anyhow::Result<()> {
             port,
         } => {
             let kb_path = require_kb_path(kb_path, cfg.kb_path.clone())?;
-            let model = model.or(cfg.model).unwrap_or_default();
+            let embedding = cfg.resolve_embedding(model)?;
             let reranker = reranker.or(cfg.reranker).unwrap_or_default();
             // rerank_by_default の CLI 既定値は `true` (reranker 有効時のみ意味を持つ)。
             let rerank_by_default = rerank_by_default.or(cfg.rerank_by_default).unwrap_or(true);
@@ -555,7 +555,7 @@ fn main() -> anyhow::Result<()> {
             rt.block_on(async {
                 kb_mcp::server::run_server(
                     &kb_path,
-                    model,
+                    embedding,
                     reranker,
                     rerank_by_default,
                     exclude_headings,
@@ -581,17 +581,17 @@ fn main() -> anyhow::Result<()> {
             progress,
         } => {
             let kb_path = require_kb_path(kb_path, cfg.kb_path.clone())?;
-            let model = model.or(cfg.model).unwrap_or_default();
+            let embedding = cfg.resolve_embedding(model)?;
 
             let db_path = kb_mcp::resolve_db_path(&kb_path);
             let db = kb_mcp::db::Database::open(&db_path.to_string_lossy())?;
             // モデル DL (BGE-M3 なら ~2.3 GB) の前に meta 整合性を先に確認する。
             // そうしないと不整合時にユーザが不要な DL を待たされる。
-            let dim = model.dimension() as u32;
+            let dim = embedding.dimension() as u32;
             if !force {
-                db.verify_embedding_meta(model.model_id(), dim)?;
+                db.verify_embedding_meta(embedding.model_id(), dim)?;
             }
-            let mut embedder = kb_mcp::embedder::Embedder::with_model(model)?;
+            let mut embedder = kb_mcp::embedder::Embedder::with_settings(embedding)?;
             if force {
                 db.reset_for_model(embedder.model_id(), dim)?;
             }
@@ -678,15 +678,15 @@ fn main() -> anyhow::Result<()> {
             } = args;
 
             let kb_path = require_kb_path(kb_path, cfg.kb_path.clone())?;
-            let model = model.or(cfg.model).unwrap_or_default();
+            let embedding = cfg.resolve_embedding(model)?;
             let reranker_choice = reranker.or(cfg.reranker).unwrap_or_default();
 
             let db_path = kb_mcp::resolve_db_path(&kb_path);
             let db = kb_mcp::db::Database::open(&db_path.to_string_lossy())?;
-            let dim = model.dimension() as u32;
-            db.verify_embedding_meta(model.model_id(), dim)?;
+            let dim = embedding.dimension() as u32;
+            db.verify_embedding_meta(embedding.model_id(), dim)?;
 
-            let mut embedder = kb_mcp::embedder::Embedder::with_model(model)?;
+            let mut embedder = kb_mcp::embedder::Embedder::with_settings(embedding)?;
             let query_embedding = embedder.embed_single(&query)?;
 
             let server_default = cfg
@@ -798,7 +798,7 @@ fn main() -> anyhow::Result<()> {
             format,
         } => {
             let kb_path = require_kb_path(kb_path, cfg.kb_path.clone())?;
-            let model = model.or(cfg.model).unwrap_or_default();
+            let embedding = cfg.resolve_embedding(model)?;
 
             let db_path = kb_mcp::resolve_db_path(&kb_path);
             // Status と同じく、DB がまだ作られていない状態を親切なエラーで弾く。
@@ -810,7 +810,7 @@ fn main() -> anyhow::Result<()> {
                 );
             }
             let db = kb_mcp::db::Database::open(&db_path.to_string_lossy())?;
-            db.verify_embedding_meta(model.model_id(), model.dimension() as u32)?;
+            db.verify_embedding_meta(embedding.model_id(), embedding.dimension() as u32)?;
 
             let opts = kb_mcp::graph::GraphOptions {
                 depth: depth.min(kb_mcp::graph::MAX_DEPTH),
@@ -878,7 +878,7 @@ fn main() -> anyhow::Result<()> {
             } = args;
 
             let kb_path = require_kb_path(kb_path, cfg.kb_path.clone())?;
-            let model_choice = model.or(cfg.model).unwrap_or_default();
+            let embedding = cfg.resolve_embedding(model)?;
             let reranker_choice = reranker.or(cfg.reranker).unwrap_or_default();
 
             let eval_cfg = cfg.eval.clone().unwrap_or_default();
@@ -895,7 +895,7 @@ fn main() -> anyhow::Result<()> {
             let opts = kb_mcp::eval::RunOpts {
                 kb_path: kb_path.clone(),
                 golden_path,
-                model_choice,
+                embedding,
                 reranker_choice,
                 k_values,
                 limit: limit_val,
