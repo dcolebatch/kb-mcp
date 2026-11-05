@@ -47,6 +47,18 @@ reranker = "bge-v2-m3"
 rerank_by_default = true
 fastembed_cache_dir = "/home/you/.cache/huggingface/hub"
 
+# Optional: OpenAI-compatible embeddings (e.g. local Ollama). When set,
+# document/query vectors come from this endpoint instead of FastEmbed.
+# Index identity becomes `openai:{model}`; switching requires `index --force`.
+# CLI `--model` forces FastEmbed for that invocation and overrides this section.
+# [embedding]
+# provider = "openai-compatible"
+# endpoint = "http://127.0.0.1:11434/v1/embeddings"
+# model = "nomic-embed-text"
+# dimension = 768
+# timeout_seconds = 120
+# batch_size = 32
+
 # Heading substrings to exclude from chunking. Omit the key for no exclusions
 # (the default is an empty list). Any heading containing one of these
 # substrings — and its body content — is dropped from the chunk stream.
@@ -122,6 +134,16 @@ bind = "127.0.0.1:3100"
 # enabled = false
 # whole_doc_threshold_tokens = 100   # token_count below this -> whole document fallback
 # max_expanded_tokens = 2000         # cap for adjacent merge / whole-doc (BGE-M3 <= 8192)
+```
+
+A/B FastEmbed vs OpenAI-compatible (e.g. Ollama) without disturbing the live `.kb-mcp.db`:
+
+```bash
+cargo build --release
+KB_MCP_BIN=./target/release/kb-mcp bash scripts/ab-eval.sh \
+  --kb-path /path/to/knowledge-base \
+  --golden /path/to/knowledge-base/.kb-mcp-eval.yml
+# writes tmp/kb-mcp-ab/results/{fastembed,ollama}.json and compare.md
 ```
 
 With the file in place `kb-mcp serve` / `index` / `status` / `graph` / `search` all work without any of those flags. Unknown keys are rejected to catch typos early. `FASTEMBED_CACHE_DIR` from the real environment overrides the file entry.

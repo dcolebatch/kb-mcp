@@ -8,7 +8,9 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
-use crate::embedder::{ModelChoice, RerankerChoice};
+use crate::embedder::{
+    EmbeddingSettings, ModelChoice, OpenAiCompatibleConfig, RerankerChoice,
+};
 use crate::parser::ParsersConfig;
 use crate::quality::QualityFilterConfig;
 use crate::transport::TransportConfig;
@@ -79,6 +81,32 @@ pub struct Config {
     pub search: Option<SearchConfig>,
     /// MCP tool response timing instrumentation (opt-out).
     pub instrumentation: Option<InstrumentationConfig>,
+    /// Optional embedding provider override. Absent = FastEmbed via top-level
+    /// `model` / `--model`. Set `provider = "openai-compatible"` to embed via
+    /// an OpenAI-compatible HTTP endpoint (e.g. local Ollama).
+    pub embedding: Option<EmbeddingConfig>,
+}
+
+/// `[embedding]` section — FastEmbed (default) or OpenAI-compatible HTTP.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EmbeddingConfig {
+    /// `"fastembed"` (default when section present without provider) or
+    /// `"openai-compatible"`.
+    pub provider: Option<String>,
+    /// Full embeddings URL, e.g. `http://127.0.0.1:11434/v1/embeddings`.
+    pub endpoint: Option<String>,
+    /// Model alias sent to the endpoint (also forms index identity
+    /// `openai:{model}`).
+    pub model: Option<String>,
+    /// Declared embedding dimension; every response vector is checked.
+    pub dimension: Option<usize>,
+    /// HTTP timeout in seconds (default 60).
+    pub timeout_seconds: Option<u64>,
+    /// Max inputs per HTTP request (default 32).
+    pub batch_size: Option<usize>,
+    /// Optional bearer token (`Authorization: Bearer …`).
+    pub api_key: Option<String>,
 }
 
 /// `get_best_practice` の opt-in 設定。
@@ -449,6 +477,62 @@ impl Config {
             && self.transport.is_none()
             && self.eval.is_none()
             && self.search.is_none()
+            && self.embedding.is_none()
+    }
+
+    /// Resolve embedding settings.
+    ///
+    /// - If `cli_model` is `Some`, FastEmbed with that model wins (overrides
+    ///   `[embedding]`).
+    /// - Else if `[embedding].provider = "openai-compatible"`, use HTTP.
+    /// - Else FastEmbed from top-level `model` / default.
+    pub fn resolve_embedding(
+        &self,
+        cli_model: Option<ModelChoice>,
+    ) -> Result<EmbeddingSettings> {
+        if let Some(choice) = cli_model {
+            return Ok(EmbeddingSettings::fastembed(choice));
+        }
+
+        if let Some(emb) = &self.embedding {
+            let provider = emb
+                .provider
+                .as_deref()
+                .unwrap_or("fastembed")
+                .trim()
+                .to_ascii_lowercase();
+            match provider.as_str() {
+                "fastembed" => {}
+                "openai-compatible" => {
+                    let endpoint = emb.endpoint.clone().ok_or_else(|| {
+                        anyhow::anyhow!("[embedding].endpoint is required for openai-compatible")
+                    })?;
+                    let model = emb.model.clone().ok_or_else(|| {
+                        anyhow::anyhow!("[embedding].model is required for openai-compatible")
+                    })?;
+                    let dimension = emb.dimension.ok_or_else(|| {
+                        anyhow::anyhow!("[embedding].dimension is required for openai-compatible")
+                    })?;
+                    return EmbeddingSettings::openai_compatible(OpenAiCompatibleConfig {
+                        endpoint,
+                        model,
+                        dimension,
+                        timeout_seconds: emb.timeout_seconds.unwrap_or(60),
+                        batch_size: emb.batch_size.unwrap_or(32),
+                        api_key: emb.api_key.clone(),
+                    });
+                }
+                other => {
+                    anyhow::bail!(
+                        "[embedding].provider must be \"fastembed\" or \"openai-compatible\", got {other:?}"
+                    );
+                }
+            }
+        }
+
+        Ok(EmbeddingSettings::fastembed(
+            self.model.unwrap_or_default(),
+        ))
     }
 
     /// `exclude_dirs` の実効値を返す。設定省略時は [`DEFAULT_EXCLUDE_DIRS`]
@@ -508,6 +592,23 @@ impl Config {
                 anyhow::bail!(
                     "[search.parent_retriever].max_expanded_tokens must be <= 8192 (BGE-M3 context window), got {}",
                     s.parent_retriever.max_expanded_tokens
+                );
+            }
+        }
+        // Validate openai-compatible settings when present (no network).
+        if let Some(emb) = &self.embedding {
+            let provider = emb
+                .provider
+                .as_deref()
+                .unwrap_or("fastembed")
+                .trim()
+                .to_ascii_lowercase();
+            if provider == "openai-compatible" {
+                let _ = self.resolve_embedding(None)?;
+            } else if provider != "fastembed" {
+                anyhow::bail!(
+                    "[embedding].provider must be \"fastembed\" or \"openai-compatible\", got {:?}",
+                    emb.provider
                 );
             }
         }
@@ -631,6 +732,32 @@ mod tests {
             cfg.exclude_headings.as_deref(),
             Some(&["次の深堀り候補".to_string(), "参考リンク".to_string()][..])
         );
+    }
+
+    #[test]
+    fn test_embedding_openai_compatible_section() {
+        let toml = r#"
+            model = "bge-m3"
+            [embedding]
+            provider = "openai-compatible"
+            endpoint = "http://127.0.0.1:11434/v1/embeddings"
+            model = "nomic-embed-text"
+            dimension = 768
+            timeout_seconds = 120
+            batch_size = 16
+        "#;
+        let cfg: Config = toml::from_str(toml).expect("parse");
+        let settings = cfg.resolve_embedding(None).expect("resolve");
+        assert_eq!(settings.model_id(), "openai:nomic-embed-text");
+        assert_eq!(settings.dimension(), 768);
+        assert!(settings.is_openai_compatible());
+
+        // CLI --model forces FastEmbed over [embedding].
+        let forced = cfg
+            .resolve_embedding(Some(ModelChoice::BgeSmallEnV15))
+            .unwrap();
+        assert_eq!(forced.model_id(), "bge-small-en-v1.5");
+        assert!(!forced.is_openai_compatible());
     }
 
     #[test]

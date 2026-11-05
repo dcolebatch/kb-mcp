@@ -24,6 +24,10 @@ axum = "0.8"
 # 入っているので追加コストなし。
 http = "1"
 fastembed = "5"
+# OpenAI-compatible embedding provider (Ollama, TEI, etc.). Blocking client
+# keeps the Embedder API sync for index/eval/watcher; async MCP search wraps
+# calls in spawn_blocking.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 rusqlite = { version = "0.39", features = ["bundled"] }
 sqlite-vec = "0.1"
 pulldown-cmark = "0.13"
@@ -97,6 +101,8 @@ tower = { version = "0.5", features = ["util"] }
 # trading ~30s of compile time per first build for (no HTML; we already use
 # the JSON output for trend tracking).
 criterion = { version = "0.5", default-features = false }
+# Local HTTP mock for OpenAI-compatible embedder tests.
+httpmock = "0.7"
 
 # Each `[[bench]]` entry below MUST set `harness = false` because criterion
 # brings its own harness. `name` matches the file under `benches/`.
